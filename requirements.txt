@@ -1,0 +1,3 @@
+# Only needed for pull_test.py. The push servers (caps.py, door_open.py,
+# adms.py) use the standard library alone.
+pyzk>=0.9
