@@ -96,6 +96,22 @@ Copy `.env.example` to `.env` and fill in your own values. Nothing in this repo
 contains real device credentials — the comm key, device IP, and control token
 are all read from the environment.
 
+For `server.py` you can skip the exporting entirely and keep settings in a file:
+
+```bash
+cp dev.env.example dev.env
+python3 -c "import secrets; print('ZK_AUTH_TOKEN=' + secrets.token_urlsafe(24))" >> dev.env
+
+python3 server.py --dev                 # loads ./dev.env
+python3 server.py --env-file prod.env    # any other file, repeatable
+```
+
+`dev.env` is a dry run: punches are stored and logged, nothing is forwarded, so
+no cloud account is needed. Real environment variables still win over the file
+(`ZK_PORT=9000 python3 server.py --dev`) unless you pass `--override-env`; a
+positional port argument beats both. `dev.env` is gitignored because it holds a
+working operator token — only the `*.env.example` templates are tracked.
+
 ## Usage
 
 Generate a control token and start the server:
@@ -157,8 +173,9 @@ latch — `/sweep` and `/hold` exist to find out which applies to yours.
 ## Environment variables
 
 `server.py` has a larger set, all documented with defaults in `.env.example`;
-run `python3 server.py --check-config` to validate them. The variables shared
-with the exploratory scripts:
+run `python3 server.py --check-config` to validate them (add `--dev` or
+`--env-file PATH` to validate a file's worth of settings instead of the
+environment's). The variables shared with the exploratory scripts:
 
 | Variable | Used by | Meaning |
 | --- | --- | --- |

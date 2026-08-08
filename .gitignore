@@ -9,10 +9,12 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
-# Local secrets / config — never commit
+# Local secrets / config — never commit. dev.env holds a working operator
+# token, so only the *.example templates are tracked.
 .env
 .env.*
-!.env.example
+*.env
+!*.env.example
 
 # Editor / OS
 .vscode/

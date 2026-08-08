@@ -35,8 +35,16 @@ RUN
 ---
     export ZK_AUTH_TOKEN="$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')"
     export ZK_DEVICE_TZ="Asia/Kolkata"
-    python3 server.py --check-config      # validate env and exit
+    python3 server.py --check-config      # validate config and exit
     python3 server.py                     # listens on :8081
+
+Settings can come from a file instead of the environment:
+
+    python3 server.py --dev               # load ./dev.env (dry run, no cloud)
+    python3 server.py --env-file prod.env # any file; repeatable, later wins
+
+Real environment variables override the file (use --override-env to invert
+that), and a positional port argument overrides both.
 
 Device -> Comm -> Cloud Server Settings:
     Server Address: <this machine's IP>   (macOS: ipconfig getifaddr en0)
@@ -135,6 +143,58 @@ _ATTLOG_RE = re.compile(
 
 class ConfigError(Exception):
     """Raised for a bad or missing environment variable."""
+
+
+# Loaded by --dev, so a development run needs no exported variables at all.
+DEV_ENV_FILE = "dev.env"
+
+_ENV_LINE_RE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+
+
+def load_env_file(path, override=False, protect=None):
+    """Merge KEY=VALUE lines from `path` into os.environ.
+
+    Accepts the same shape as the `.env` files these scripts already document:
+    blank lines, `#` comments, an optional `export ` prefix, and single- or
+    double-quoted values. The real environment wins by default, so an exported
+    variable (or a systemd unit's Environment=) still overrides the file and a
+    one-off `ZK_PORT=9000 python3 server.py --dev` does what it looks like.
+
+    `protect` is the set of names the real environment supplied, snapshotted
+    before the first file was read. Pass it when layering several files so a
+    later file can override an earlier one while both still yield to the real
+    environment; it defaults to whatever is in os.environ right now.
+    `override=True` ignores it and lets the file win over everything.
+
+    Returns the list of names taken from the file.
+    """
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            lines = fh.readlines()
+    except OSError as e:
+        raise ConfigError(f"cannot read config file {path}: {e.strerror}")
+
+    if protect is None:
+        protect = frozenset(os.environ)
+
+    applied = []
+    for lineno, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = _ENV_LINE_RE.match(line)
+        if not m:
+            raise ConfigError(f"{path}:{lineno}: expected KEY=value, got {line!r}")
+        name, raw = m.group(1), m.group(2).strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+            value = raw[1:-1]
+        else:
+            # An unquoted value ends at an inline comment; quote it to keep a #.
+            value = raw.split(" #", 1)[0].strip()
+        if override or name not in protect:
+            os.environ[name] = value
+            applied.append(name)
+    return applied
 
 
 def _env_int(name, default):
@@ -1517,13 +1577,42 @@ def main(argv=None):
         description="Production iclock/ADMS push server for eSSL terminals.")
     ap.add_argument("port", nargs="?", type=int,
                     help="listen port (overrides $ZK_PORT, default 8081)")
+    ap.add_argument("--env-file", action="append", metavar="PATH", default=[],
+                    help="read ZK_* settings from a KEY=value file; repeatable, "
+                         "later files win. Real environment variables still "
+                         "override the file unless --override-env is given.")
+    ap.add_argument("--dev", action="store_true",
+                    help=f"development mode: load ./{DEV_ENV_FILE}")
+    ap.add_argument("--override-env", action="store_true",
+                    help="let the file(s) win over already-exported variables")
     ap.add_argument("--check-config", action="store_true",
                     help="validate configuration and exit")
     args = ap.parse_args(argv)
 
     # Log to stdout at INFO before config is parsed, so config warnings show.
     logging.basicConfig(level=logging.INFO, format="%(levelname)-7s %(message)s")
+
+    # --dev is a shorthand for the repo's dev.env, and is applied first so an
+    # explicit --env-file can layer on top of it.
+    paths = list(args.env_file)
+    if args.dev:
+        dev_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                DEV_ENV_FILE)
+        if not os.path.exists(dev_path):
+            print(f"configuration error: --dev needs {DEV_ENV_FILE}, which is "
+                  f"gitignored. Copy it from {DEV_ENV_FILE}.example and edit.",
+                  file=sys.stderr)
+            return 2
+        paths.insert(0, dev_path)
+
     try:
+        # Snapshot first: every file yields to the real environment, but a
+        # later file may override an earlier one.
+        preset = frozenset(os.environ)
+        for path in paths:
+            names = load_env_file(path, override=args.override_env,
+                                  protect=preset)
+            LOG.info("config file %s: %d setting(s) applied", path, len(names))
         cfg = Config.from_env(args.port)
         setup_logging(cfg)
     except ConfigError as e:
