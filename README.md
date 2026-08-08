@@ -13,14 +13,73 @@ vendor software.
 
 ## Scripts
 
+`server.py` is the one you run for real. The rest are the exploratory tools it
+grew out of — keep them for poking at a new device, not for production.
+
 | Script | What it's for |
 | --- | --- |
+| `server.py` | **The production server.** Everything below, plus durable storage, de-duplication, and reliable forwarding of each punch to a cloud endpoint. See [Production server](#production-server) and [ROADMAP.md](ROADMAP.md). |
 | `adms.py` | Catch-all request logger. Run this first to confirm the device can actually reach your machine — it dumps every request in full. |
 | `door_open.py` | Minimal push server: handshake, live attendance punches, remote door open/hold/release. |
 | `caps.py` | Superset of `door_open.py`, plus capability discovery (`/caps`) and parameter get/set (`/setopt`, `/setsensor`). Use this one if you're exploring what the firmware supports. |
 | `pull_test.py` | Tests the *opposite* direction — a direct pyzk pull to port 4370. Many standalone terminals never answer this; a timeout is a normal result. |
 
 Everything except `pull_test.py` is standard library only.
+
+## Production server
+
+```bash
+export ZK_AUTH_TOKEN="$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')"
+export ZK_DEVICE_TZ="Asia/Kolkata"     # required: the device sends naive local time
+export ZK_SINKS="log"                  # dry run — store punches, forward nothing
+
+python3 server.py --check-config       # validate the environment and exit
+python3 server.py                      # listens on :8081
+```
+
+Point the device at it exactly as described below, then watch punches land:
+
+```
+09:14:22 INFO  HANDSHAKE (cdata GET)   SN=XXXXXXXXXX (first contact)
+09:14:33 INFO  POLL (getrequest)       SN=XXXXXXXXXX (+11.2s)
+09:14:46 INFO  UPLOAD (table=ATTLOG)   SN=XXXXXXXXXX (+12.8s)
+09:14:46 INFO  PUNCH 12 2026-08-08 09:14:22 2026-08-08T03:44:22Z (check_in via fingerprint)
+09:14:46 INFO  delivered 1 row(s) -> infino [de65a370b37e]
+```
+
+To forward punches to [Infino Cloud](https://infino.ai/docs), set
+`ZK_SINKS=infino` with `ZK_INFINO_DATABASE` and `ZK_INFINO_API_KEY`. Punches are
+appended as rows to an `attendance` table, which the server creates on startup
+if it doesn't exist.
+
+Each punch is committed to SQLite before the device is acknowledged and queued
+in an outbox that a background worker drains in batches with exponential
+backoff, honouring `Retry-After` on Infino's cold-start 503. A cloud outage
+delays delivery rather than losing punches. Every row carries a stable
+`event_id` derived from the punch itself, which is what makes the device's habit
+of re-uploading whole batches harmless — and, since Infino has no idempotency
+mechanism, it is also how readers should dedup:
+
+```sql
+SELECT employee_pin, punched_at_local, direction
+  FROM attendance
+ WHERE local_date = '2026-08-08' AND direction = 'check_in'
+```
+
+Operator endpoints (`?token=` or an `X-Auth-Token` header):
+
+| Endpoint | Effect |
+| --- | --- |
+| `/healthz` | Liveness. No token, no personal data. 503 when the device has gone quiet or deliveries are dead-lettered. |
+| `/status` | Devices, queue depth, delivery counters |
+| `/punches?limit=20` | Most recent stored punches |
+| `/open?door=1&sec=5` | Momentary unlock |
+| `/hold` / `/release` | Latch the door open / re-lock it |
+| `/raw?p=…`, `/reboot` | Only with `ZK_DEBUG_ENDPOINTS=1` |
+
+All settings are documented in `.env.example`. The discovery endpoints
+(`/caps`, `/setopt`, `/sweep`, …) are deliberately absent — that work belongs in
+`caps.py`.
 
 ## Setup
 
@@ -97,9 +156,14 @@ latch — `/sweep` and `/hold` exist to find out which applies to yours.
 
 ## Environment variables
 
+`server.py` has a larger set, all documented with defaults in `.env.example`;
+run `python3 server.py --check-config` to validate them. The variables shared
+with the exploratory scripts:
+
 | Variable | Used by | Meaning |
 | --- | --- | --- |
 | `ZK_AUTH_TOKEN` | push servers | Shared secret for control endpoints. Required. |
+| `ZK_DEVICE_TZ` | `server.py` | IANA zone the device's clock is set to. Required. |
 | `ZK_PORT` | push servers | Listen port (default `8081`; a CLI argument overrides it). |
 | `ZK_BIND` | push servers | Bind address (default `0.0.0.0`, since the device dials in). |
 | `ZK_DEVICE_IP` | `pull_test.py` | Device address. |
@@ -120,7 +184,10 @@ Read this before running any of it:
   offers no real authentication; that's a property of these devices, not of
   this code.
 - **Server output contains device serial numbers and attendance records.**
-  Review logs before sharing them.
+  Review logs before sharing them. `server.py` also stores punches on disk at
+  `$ZK_DB_PATH` — that file is personal data, so give it restrictive
+  permissions and set a retention period. `ZK_REDACT_PINS=1` hashes employee
+  IDs in logs and API output.
 - Keep `$ZK_AUTH_TOKEN` and your device Comm Key in the environment or `.env`
   (gitignored), never in source.
 

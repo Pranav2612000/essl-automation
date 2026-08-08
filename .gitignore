@@ -21,3 +21,12 @@ __pycache__/
 
 # Captured device logs
 *.log
+
+# Attendance database — personal data, never commit
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Identity mapping (phase 4)
+directory.yaml
