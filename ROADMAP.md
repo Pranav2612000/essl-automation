@@ -163,7 +163,17 @@ built and tested; `[ ]` is not started.
   phases 6–8 want retrieval over attendance history.
 
 ### Phase 4 — Identity directory
-- [ ] **M4.1** `directory.yaml` (gitignored): `pin → {name, email, github_login,
+- [x] **M4.0** One-off device roster sync. `/users/sync` queues
+  `DATA QUERY USERINFO` at the terminal; `USER` records are harvested from
+  whatever upload the reply arrives on (firmware disagrees on the table), kept
+  in `device_users`, and read back from `/users`. This is run by hand to seed
+  M4.1 — it is not a live mirror of the device, so a person enrolled after the
+  sync stays unknown until it is run again. Biometric templates and `Passwd`
+  are stripped before anything is logged or stored; only the fact that a
+  password is set is kept.
+- [ ] **M4.1** `directory.json` (gitignored): `pin → {name, slack, github}`,
+  built by hand from the M4.0 dump. Supersedes the YAML sketch below.
+- [ ] **M4.1a** `directory.yaml` (gitignored): `pin → {name, email, github_login,
   slack_user_id, timezone, active, greetings_enabled}`.
 - [ ] **M4.2** Loader behind a `Directory` interface — not inline file reads —
   so M4.5 is a swap. Validate on load; reload on SIGHUP.

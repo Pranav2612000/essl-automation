@@ -63,6 +63,8 @@ Operator (require $ZK_AUTH_TOKEN as ?token= or an X-Auth-Token header):
     /healthz             liveness, no token, no data
     /status              devices, outbox depth, queued commands
     /punches?limit=20    most recent stored punches
+    /users/sync          ask the device to upload its user table (one-off)
+    /users               read back the user table it sent
     /open?door=1&sec=5   momentary unlock
     /hold  /release      latch open / re-lock
     /raw?p=01010105      arbitrary control payload  (ZK_DEBUG_ENDPOINTS=1)
@@ -125,6 +127,13 @@ VERIFY_METHOD = {
     4: "card_or_fingerprint",
     15: "face",
 }
+# USERINFO `Pri` field: what the person may do on the terminal itself.
+PRIVILEGE = {
+    0: "user",
+    2: "enroller",
+    6: "admin",
+    14: "super_admin",
+}
 
 # Fallback parse for firmware that pads ATTLOG columns with spaces rather than
 # tabs. The timestamp itself contains a space, so a plain split() won't do.
@@ -135,6 +144,25 @@ _ATTLOG_RE = re.compile(
     r"(?:\s+(?P<verify>\S+))?"
     r"(?:\s+(?P<workcode>\S+))?"
 )
+
+# A user record, as the terminal emits it in reply to DATA QUERY USERINFO:
+#     USER PIN=7<TAB>Name=Asha Rao<TAB>Pri=0<TAB>Passwd=<TAB>Card=12345<TAB>Grp=1<TAB>TZ=…
+# The same dump also carries FP / FACE / BIODATA lines holding biometric
+# templates. We do not parse those — but they still pass through the log and
+# the `uploads` table, which is what _SECRET_VALUE_RE below is for.
+_USER_PREFIX_RE = re.compile(r"^\s*USER\s+", re.I)
+# Fields to strip out of anything we log or store: biometric templates, and
+# the terminal password, which is a credential that opens a door.
+# The trailing lookahead stops the redaction at the next field rather than at
+# the next tab: space-padded firmware would otherwise lose the whole rest of
+# the record from the copy we keep.
+_SECRET_VALUE_RE = re.compile(
+    r"((?:^|[\t ])(?:tmp|template|content|passwd|password|pw)=)"
+    r"[^\r\n]*?(?=[\t ]+[A-Za-z][A-Za-z0-9_]*=|[\r\n]|$)",
+    re.I)
+# A key in a `Key=value` record. The lookbehind stops it matching inside a
+# value; keys always follow a separator.
+_KV_KEY_RE = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9_]*)=")
 
 
 # --------------------------------------------------------------------------
@@ -538,6 +566,60 @@ def parse_attlog_line(line, serial, tz, received_utc):
     )
 
 
+def parse_kv_record(payload):
+    """
+    Parse a `Key=value` device record into a dict.
+
+    Canonical form is tab-separated. Firmware that pads with spaces instead
+    defeats a naive split, because a value — a person's name — may itself
+    contain spaces. In that case we locate the keys and take everything
+    between one key and the next as the value.
+    """
+    out = {}
+    if "\t" in payload:
+        for field in payload.split("\t"):
+            key, sep, value = field.partition("=")
+            if sep and key.strip():
+                out[key.strip()] = value.strip()
+        return out
+    marks = list(_KV_KEY_RE.finditer(payload))
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(payload)
+        out[m.group(1)] = payload[m.end():end].strip()
+    return out
+
+
+def parse_user_line(line):
+    """
+    Parse one USER record into its fields, or return None if the line isn't
+    one. FP / FACE / BIODATA lines from the same dump return None: their
+    payload is a biometric template we have no use for and no reason to hold.
+    """
+    m = _USER_PREFIX_RE.match(line)
+    if not m:
+        return None
+    fields = parse_kv_record(line[m.end():])
+    pin = (fields.get("PIN") or fields.get("Pin") or "").strip()
+    if not pin:
+        return None
+    fields["PIN"] = pin
+    return fields
+
+
+def scrub_secrets(text):
+    """
+    Replace biometric templates and terminal passwords with a marker.
+
+    Asking the device for its user list means USER / FP / FACE / BIODATA
+    bodies now flow through the log and the `uploads` table. The templates in
+    them are biometric data with no use anywhere in this system, and `Passwd`
+    is a credential that opens a door — neither belongs in anything durable.
+    Callers hand the *unscrubbed* body to the parser, which keeps only the
+    fact that a password is set.
+    """
+    return _SECRET_VALUE_RE.sub(r"\1<redacted>", text)
+
+
 # --------------------------------------------------------------------------
 # Storage
 # --------------------------------------------------------------------------
@@ -586,6 +668,28 @@ CREATE TABLE IF NOT EXISTS outbox (
 );
 CREATE INDEX IF NOT EXISTS outbox_ready
     ON outbox (state, next_attempt_utc);
+
+-- The terminal's own user roster, captured by the one-off /users/sync dump.
+-- This is what you copy out to build the identity file that adds each
+-- person's Slack and GitHub handles, so nothing here is invented — every
+-- column is a field the device actually sent.
+--
+-- No password column: `Passwd` is a credential that unlocks a door, so only
+-- whether one is set is recorded.
+CREATE TABLE IF NOT EXISTS device_users (
+    serial          TEXT NOT NULL,
+    pin             TEXT NOT NULL,
+    name            TEXT,
+    privilege       INTEGER,
+    card            TEXT,
+    group_id        TEXT,
+    timezones       TEXT,
+    has_password    INTEGER NOT NULL DEFAULT 0,
+    raw             TEXT,
+    first_seen_utc  TEXT NOT NULL,
+    last_seen_utc   TEXT NOT NULL,
+    PRIMARY KEY (serial, pin)
+);
 
 -- Non-attendance uploads (OPERLOG door events, options replies, ...). Kept
 -- capped and raw so door-event work later has real samples to build on.
@@ -680,6 +784,49 @@ class Store:
                     (punch_id, sink, punch.dedup_key, payload, now, now))
         return True
 
+    def record_device_user(self, serial, fields, raw):
+        """
+        Upsert one person from a USER record.
+
+        A field the device omitted leaves the stored value alone: DATA QUERY
+        replies and OPERLOG pushes carry different subsets on some firmware,
+        and a partial record must not blank out a name we already have.
+
+        `raw` is kept for the fields we did not model, and is scrubbed here
+        rather than by the caller — `fields` has already yielded everything we
+        want from the password, so the line itself must not carry it into the
+        database.
+        """
+        now = _iso(_utcnow())
+
+        def _int(name):
+            try:
+                return int(fields[name])
+            except (KeyError, TypeError, ValueError):
+                return None
+
+        password = fields.get("Passwd") or fields.get("PW") or ""
+        with self.conn as conn:
+            conn.execute(
+                """INSERT INTO device_users
+                       (serial, pin, name, privilege, card, group_id,
+                        timezones, has_password, raw, first_seen_utc,
+                        last_seen_utc)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(serial, pin) DO UPDATE SET
+                       name         = COALESCE(excluded.name, name),
+                       privilege    = COALESCE(excluded.privilege, privilege),
+                       card         = COALESCE(excluded.card, card),
+                       group_id     = COALESCE(excluded.group_id, group_id),
+                       timezones    = COALESCE(excluded.timezones, timezones),
+                       has_password = excluded.has_password,
+                       raw          = excluded.raw,
+                       last_seen_utc = excluded.last_seen_utc""",
+                (serial, fields["PIN"], fields.get("Name") or None, _int("Pri"),
+                 fields.get("Card") or None, fields.get("Grp") or None,
+                 fields.get("TZ") or None, 1 if password.strip() else 0,
+                 scrub_secrets(raw)[:512], now, now))
+
     def record_upload(self, serial, table_name, body):
         with self.conn as conn:
             conn.execute(
@@ -744,6 +891,17 @@ class Store:
             """SELECT pin, punched_local, punched_utc, status, verify, serial
                  FROM punches ORDER BY id DESC LIMIT ?""",
             (max(1, min(500, limit)),)).fetchall()
+
+    def device_users(self, serial=None):
+        """The roster, ordered by PIN numerically where the PIN is a number."""
+        where = "WHERE serial = ?" if serial else ""
+        params = (serial,) if serial else ()
+        return self.conn.execute(f"""
+            SELECT serial, pin, name, privilege, card, group_id, timezones,
+                   has_password, first_seen_utc, last_seen_utc
+              FROM device_users {where}
+             ORDER BY CAST(pin AS INTEGER), pin
+        """, params).fetchall()
 
 
 # --------------------------------------------------------------------------
@@ -1157,6 +1315,17 @@ class DeviceRegistry:
 # HTTP handler
 # --------------------------------------------------------------------------
 
+# Ask the terminal to upload its whole user table. There is no single form
+# every firmware honours — the wildcard is the most widely supported, the bare
+# form is what older builds want — so both are queued and whichever produces
+# USER records wins. Unrecognised commands are answered with a non-zero Return
+# and are otherwise harmless.
+_USERINFO_QUERIES = (
+    "DATA QUERY USERINFO PIN=*",
+    "DATA QUERY USERINFO",
+)
+
+
 def _door_payload(door, seconds, cc="01", dd="00"):
     """
     Build a CONTROL DEVICE payload per the ZK PUSH spec:
@@ -1346,6 +1515,62 @@ class Handler(BaseHTTPRequestHandler):
         # would block every later punch behind it.
         self._reply(f"OK: {accepted + malformed}")
 
+    # ---- user roster ---------------------------------------------------
+    def _harvest_users(self, serial, body):
+        """
+        Pick USER records out of a device upload.
+
+        Which endpoint and table the dump arrives on varies by firmware — a
+        `table=USERINFO` POST, an OPERLOG push, or the body of a devicecmd
+        reply to DATA QUERY USERINFO. Rather than guess, every non-ATTLOG body
+        is scanned; a body with no USER lines costs one failed regex per line.
+        """
+        found = 0
+        for line in body.splitlines():
+            fields = parse_user_line(line)
+            if fields is None:
+                continue
+            try:
+                self.store.record_device_user(serial, fields, line)
+                found += 1
+            except Exception:
+                # An upload must still be acknowledged or the device re-sends
+                # it forever; the roster is not worth stalling the device over.
+                LOG.exception("failed to store USER record from SN=%s", serial)
+        if found:
+            LOG.info("  harvested %d user record(s) from SN=%s", found, serial)
+        return found
+
+    def _person_json(self, row):
+        """One roster row as /users returns it."""
+        redact = self.cfg.redact_pins
+        return {
+            "serial": row["serial"],
+            "pin": self._pin_for_log(row["pin"]),
+            "name": "<redacted>" if redact else row["name"],
+            "privilege": PRIVILEGE.get(row["privilege"],
+                                       f"unknown_{row['privilege']}"),
+            "card": "<redacted>" if redact else row["card"],
+            "group": row["group_id"],
+            "timezones": row["timezones"],
+            "has_password": bool(row["has_password"]),
+            "last_seen_utc": row["last_seen_utc"],
+        }
+
+    @staticmethod
+    def _log_roster(people):
+        """Print the roster — the point of the endpoint is to read it."""
+        LOG.info("=" * 68)
+        LOG.info(" device user roster — %d user(s)", len(people))
+        LOG.info("=" * 68)
+        if not people:
+            LOG.info("  (nothing harvested yet — call /users/sync)")
+        for p in people:
+            LOG.info("  PIN %-6s %-28s %-11s card=%-10s group=%s",
+                     p["pin"], (p["name"] or "(unnamed)")[:28], p["privilege"],
+                     p["card"] or "-", p["group"] or "-")
+        LOG.info("=" * 68)
+
     def do_GET(self):
         u = urlparse(self.path)
         path = u.path.rstrip("/") or "/"
@@ -1438,6 +1663,37 @@ class Handler(BaseHTTPRequestHandler):
                  "serial": r["serial"]}
                 for r in self.store.recent_punches(limit)])
 
+        # The device's user list, for the one-off sync that seeds the identity
+        # file. /users/sync asks the terminal for it; /users reads back what
+        # came in, which is what you copy out.
+        if path == "/users":
+            serial = q.get("sn", [""])[0].strip() or None
+            people = [self._person_json(r)
+                      for r in self.store.device_users(serial)]
+            self._log_roster(people)
+            return self._reply_json({
+                "device_serial": serial,
+                "redacted": self.cfg.redact_pins,
+                "count": len(people),
+                "users": people,
+                "hint": ("Empty — call /users/sync, wait a poll or two for the "
+                         "device to answer, then reload this.")
+                        if not people else None,
+            })
+
+        if path == "/users/sync":
+            serial = self._target(q)
+            if not serial:
+                return
+            queued = [self.queue.enqueue(serial, c) for c in _USERINFO_QUERIES]
+            return self._reply(
+                f"Queued {len(queued)} user-dump command(s) for {serial}:\n"
+                + "".join(f"  {c}\n" for c in queued) +
+                "They fire one per poll (~10-15s each). Firmware differs on "
+                "which form it honours, so both are sent and whichever\n"
+                "the device answers is harvested. Watch the log, then read "
+                "/users.\n")
+
         if path == "/open":
             serial = self._target(q)
             if not serial:
@@ -1514,23 +1770,31 @@ class Handler(BaseHTTPRequestHandler):
             if table.upper() == "ATTLOG":
                 return self._handle_attlog(serial, body)
             if body.strip():
-                # OPERLOG (door events, admin actions), options replies, etc.
+                # OPERLOG (door events, admin actions), USERINFO, options
+                # replies, etc. Scrub before logging or storing: a user dump
+                # also carries biometric templates and door passwords.
+                safe = scrub_secrets(body)
                 LOG.info("  table=%s body=%s", table or "?",
-                         body.strip()[:400])
-                self.store.record_upload(serial, table, body)
+                         safe.strip()[:400])
+                self._harvest_users(serial, body)
+                self.store.record_upload(serial, table, safe)
             return self._reply("OK")
 
         if path.startswith("/iclock/devicecmd"):
             self._note(serial, "CMD RESULT (devicecmd)")
             if body.strip():
-                LOG.info("  ack: %s", body.strip()[:300])
-                self.store.record_upload(serial, "devicecmd", body)
+                safe = scrub_secrets(body)
+                LOG.info("  ack: %s", safe.strip()[:300])
+                self._harvest_users(serial, body)
+                self.store.record_upload(serial, "devicecmd", safe)
             return self._reply("OK")
 
         self._note(serial, f"OTHER POST {path}")
         if body.strip():
-            LOG.info("  body: %s", body.strip()[:300])
-            self.store.record_upload(serial, table or path, body)
+            safe = scrub_secrets(body)
+            LOG.info("  body: %s", safe.strip()[:300])
+            self._harvest_users(serial, body)
+            self.store.record_upload(serial, table or path, safe)
         return self._reply("OK")
 
 
