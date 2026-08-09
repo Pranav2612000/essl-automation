@@ -55,7 +55,8 @@ they don't exist:
 | Table | Grain | Holds |
 | --- | --- | --- |
 | `attendance` | one row per punch | device truth: user ID, time, direction, verify method |
-| `arrivals` | one row per arrival | the same event plus `person_name`, `slack_id`, `github_id` from the directory |
+| `arrivals` | **one row per person per day** | the first sighting, plus `person_name`, `slack_id`, `github_id` from the directory |
+| `device_users` | one row per roster sync | the terminal's own user list, from `/users/sync` |
 
 `event_id` is the same in both, so they join. Identity is copied onto the
 arrival row rather than referenced, so it records who someone was when they
@@ -70,16 +71,30 @@ SELECT person_name, slack_id, github_id, arrived_at_local
  WHERE local_date = '2026-08-09' AND identity_source = 'directory'
 ```
 
-`log` and `log_arrivals` are the dry-run equivalents: same outbox, same rows,
-printed instead of sent.
+`log` and `log_arrivals` are the dry-run equivalents: same rows, printed
+instead of sent, so the shape can be checked with no cloud account.
 
-Each punch is committed to SQLite before the device is acknowledged and queued
-in an outbox that a background worker drains in batches with exponential
-backoff, honouring `Retry-After` on Infino's cold-start 503. A cloud outage
-delays delivery rather than losing punches. Every row carries a stable
-`event_id` derived from the punch itself, which is what makes the device's habit
-of re-uploading whole batches harmless — and, since Infino has no idempotency
-mechanism, it is also how readers should dedup:
+**There is no local database.** A punch is acknowledged only once Infino has
+accepted it, so the terminal's own buffer is the retry queue: refuse the upload
+and it keeps the records and offers them again. A cloud outage delays
+attendance rather than losing it, and nothing personal is left at rest on the
+machine running this.
+
+The cost is that the device's poll loop depends on the cloud being reachable,
+and that a row Infino rejects outright has nowhere to go — it is logged in full
+at `ERROR` and dropped, because the alternative is refusing the batch forever
+and blocking every punch behind it. Set `ZK_LOG_FILE` if you want those to
+survive a restart.
+
+`arrivals` doubles as the greeting ledger: one row per person per day means "a
+row exists" *is* "already greeted", which is what makes a greeting survive a
+restart or a device re-upload without any local state. Appends take about half
+a second to become visible to a query, so a small in-process set covers repeats
+faster than that — this terminal reports the same face twice one second apart.
+
+Every row carries a stable `event_id` derived from the punch itself. Since
+Infino has no append idempotency, a retried batch can land the same row twice,
+so readers dedup on it:
 
 ```sql
 SELECT employee_user_id, punched_at_local, direction
@@ -142,14 +157,8 @@ One row per person per day — a daily summary, not a list of events. Use
 }
 ```
 
-**Infino is the source of record.** SQLite is only the delivery buffer on the
-way there, so it is not consulted: reading it would answer a subtly different
-question depending on how far the outbox had drained. `pending_delivery` is
-reported alongside every response so a caller can tell "nobody came in" from
-"nothing has shipped yet". If Infino is unreachable the endpoint returns 502
-rather than quietly falling back to local data.
-
-`punches` counts distinct `event_id`s — Infino has no idempotency on append,
+**Infino is the only source.** If it is unreachable the endpoint returns 502
+rather than inventing an answer. `punches` counts distinct `event_id`s — Infino has no idempotency on append,
 so a retry can land the same row twice and every reader has to dedup.
 `minutes_on_site` is the span from first to last sighting, **not** a sum of
 in/out pairs: a terminal that reports no direction (every punch is status
@@ -306,10 +315,9 @@ Read this before running any of it:
   offers no real authentication; that's a property of these devices, not of
   this code.
 - **Server output contains device serial numbers and attendance records.**
-  Review logs before sharing them. `server.py` also stores punches on disk at
-  `$ZK_DB_PATH` — that file is personal data, so give it restrictive
-  permissions and set a retention period. `ZK_REDACT_PINS=1` hashes employee
-  IDs in logs and API output.
+  Review logs before sharing them. `server.py` keeps nothing on disk —
+  attendance lives only in Infino, so retention and access are decided there.
+  `ZK_REDACT_PINS=1` hashes employee IDs in logs and API output.
 - Keep `$ZK_AUTH_TOKEN` and your device Comm Key in the environment or `.env`
   (gitignored), never in source.
 

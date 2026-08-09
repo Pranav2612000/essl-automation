@@ -115,6 +115,22 @@ built and tested; `[ ]` is not started.
   `/raw` and `/reboot` behind `ZK_DEBUG_ENDPOINTS`.
 
 ### Phase 2 — Durability
+**Superseded by M2.8.** SQLite is gone: attendance is stored only in Infino,
+and the terminal's own buffer is the retry queue. M2.1–M2.5 describe the
+outbox that used to provide this; they are kept for the reasoning, not as a
+description of the code.
+
+- [x] **M2.8** **Remove SQLite.** No local database, no outbox, no delivery
+  worker. A punch is acknowledged only once Infino accepts it, so refusing the
+  upload is how a punch survives an outage — the device holds it and re-offers
+  it. Greetings are claimed once per person per day against the `arrivals`
+  table itself, which makes them survive a restart with no local state; a small
+  in-process set covers the ~600 ms window before an append is visible to a
+  query, which matters because this reader reports the same face twice one
+  second apart. A row Infino permanently rejects is logged in full at ERROR and
+  dropped, since there is no queue to park it in. `device_users` is a third
+  Infino table. Trade accepted: the device's poll loop now depends on the cloud
+  being reachable, and nothing personal is left at rest on this machine.
 - [x] **M2.1** SQLite schema (WAL, `synchronous=FULL`): `devices`, `punches`,
   `outbox`, `uploads`; thread-local connections.
 - [x] **M2.2** Idempotent insert on `dedup_key` =
@@ -128,8 +144,9 @@ built and tested; `[ ]` is not started.
 - [ ] **M2.6** Real `Stamp`/`OpStamp` high-water marks per device instead of
   9999, so the terminal stops re-offering old records. Low priority — dedup
   makes it a bandwidth issue, not a correctness one.
-- [ ] **M2.7** Retention job: purge `uploads` and delivered `outbox` rows older
-  than N days; decide the `punches` retention period with whoever owns HR data.
+- [x] **M2.7** Retention job — **moot**: nothing is stored locally to purge.
+  Retention is now an Infino-side decision, still to be agreed with whoever
+  owns HR data.
 
 ### Phase 3 — Infino cloud sink
 - [x] **M3.1** Contract established from https://infino.ai/docs. Infino Cloud is
@@ -248,11 +265,12 @@ usable trigger here; M5.1 must key off the first punch of the day rather than
 a direction. The same reader also produced two punches one second apart for a
 single face match, which is why the cooldown below is not optional.
 
-- [ ] **M5.1** Define it precisely: `status == check_in`, first row for
+- [x] **M5.1** Defined and built: not a departure, first row for
   `(user_id, local_date)`, plus a cooldown so a double-tap at the reader
   doesn't double-fire.
-- [ ] **M5.2** `greetings` table keyed `(user_id, local_date)` — the idempotency
-  guard that makes restarts and device re-uploads safe.
+- [x] **M5.2** Done as part of M2.8: the `arrivals` table *is* the ledger,
+  one row per `(user_id, local_date)`, so restarts and device re-uploads are
+  safe with no local state.
 - [ ] **M5.3** Suppression rules: quiet hours, weekends, a holiday list, and
   `greetings_enabled=false`.
 - [ ] **M5.4** Register a `greeting` sink so trigger evaluation runs on the

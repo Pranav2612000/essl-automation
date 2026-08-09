@@ -6,13 +6,15 @@ This is the service you actually run. It is derived from the exploratory
 scripts in this repo (adms.py, door_open.py, caps.py) but differs from them in
 the ways that matter once attendance data has to reach somewhere else:
 
-  * Every punch is committed to SQLite BEFORE the device is acknowledged, and
-    de-duplicated on a stable key. The terminal re-uploads whole ATTLOG batches
-    whenever it doesn't like our reply, so "at least once" delivery from the
-    device has to become "exactly once" storage here.
-  * Outbound delivery is a durable outbox drained by a background worker, not
-    an HTTP call inside the request handler. A slow or failing cloud must never
-    stall the device's poll loop or cause it to re-send.
+  * Attendance is stored only in Infino. There is no local database: a punch
+    is acknowledged to the terminal only once the cloud has accepted it, which
+    makes the device's own buffer the retry queue. Refuse the upload and it
+    keeps the records and offers them again.
+  * A greeting is claimed once per person per day against the arrivals table
+    itself, so a restart or a device re-upload cannot produce a second one.
+    Appends take about half a second to become visible to a query, so a small
+    in-process set covers repeats faster than that — this terminal reports the
+    same face twice one second apart.
   * Shared state is behind locks. ThreadingHTTPServer runs handlers
     concurrently; the exploratory scripts mutate module-level dicts and an
     integer counter without synchronisation.
@@ -101,7 +103,6 @@ import re
 import secrets
 import signal
 import socket
-import sqlite3
 import sys
 import threading
 import time
@@ -109,7 +110,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 USER_AGENT = "essl-automation-server/1.0"
@@ -287,7 +288,6 @@ class Config:
     bind: str
     auth_token: str
     device_tz: str
-    db_path: str
     directory_file: str
     log_level: str
     log_file: str
@@ -297,6 +297,7 @@ class Config:
     infino_database: str
     infino_table: str
     infino_arrivals_table: str
+    infino_users_table: str
     infino_api_key: str
     infino_timeout: float
     infino_bootstrap: bool
@@ -340,7 +341,6 @@ class Config:
             # The terminal sends naive local time. Without this we cannot say
             # what instant a punch refers to, so there is no safe default.
             device_tz=os.environ.get("ZK_DEVICE_TZ", ""),
-            db_path=os.environ.get("ZK_DB_PATH", "data/attendance.db"),
             directory_file=os.environ.get("ZK_DIRECTORY_FILE", "").strip(),
             log_level=os.environ.get("ZK_LOG_LEVEL", "INFO").upper(),
             log_file=os.environ.get("ZK_LOG_FILE", ""),
@@ -351,6 +351,8 @@ class Config:
             infino_table=os.environ.get("ZK_INFINO_TABLE", "attendance"),
             infino_arrivals_table=os.environ.get("ZK_INFINO_ARRIVALS_TABLE",
                                                  "arrivals"),
+            infino_users_table=os.environ.get("ZK_INFINO_USERS_TABLE",
+                                              "device_users"),
             # INFINO_API_KEY is the name Infino's own SDKs read, so accept it.
             infino_api_key=(os.environ.get("ZK_INFINO_API_KEY", "")
                             or os.environ.get("INFINO_API_KEY", "")),
@@ -394,6 +396,9 @@ class Config:
         elif len(self.auth_token) < 16:
             raise ConfigError("ZK_AUTH_TOKEN is shorter than 16 characters; "
                               "generate one with secrets.token_urlsafe(24)")
+        if os.environ.get("ZK_DB_PATH", "").strip():
+            LOG.warning("ZK_DB_PATH is set but ignored — there is no local "
+                        "database any more; attendance lives only in Infino.")
         if not self.directory_file:
             LOG.warning("ZK_DIRECTORY_FILE is not set — an arrival will be "
                         "logged by user ID only, with no name, Slack or GitHub. "
@@ -613,6 +618,36 @@ def arrival_payload(punch, person, tz_name):
         "verify_method": VERIFY_METHOD.get(punch.verify,
                                            f"unknown_{punch.verify}"),
         "received_at": punch.received_utc,
+        "source": USER_AGENT,
+    }
+
+
+def device_user_payload(serial, fields):
+    """
+    One roster row, matching INFINO_USERS_SCHEMA exactly.
+
+    `Passwd` is a credential that opens a door, so only whether one is set is
+    recorded — the value itself never leaves the parser.
+    """
+    def _int(name):
+        try:
+            return int(fields[name])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    password = fields.get("Passwd") or fields.get("PW") or ""
+    privilege = _int("Pri")
+    return {
+        "device_serial": serial,
+        "employee_user_id": fields["PIN"],
+        "person_name": fields.get("Name") or None,
+        "privilege": privilege,
+        "privilege_label": PRIVILEGE.get(privilege, f"unknown_{privilege}"),
+        "card": fields.get("Card") or None,
+        "group_id": fields.get("Grp") or None,
+        "timezones": fields.get("TZ") or None,
+        "has_password": 1 if password.strip() else 0,
+        "synced_at": _iso(_utcnow()),
         "source": USER_AGENT,
     }
 
@@ -936,410 +971,18 @@ class Directory:
         return self
 
 
-# How long after announcing someone's arrival to stay quiet about them. Long
-# enough to swallow a reader that matches twice, short enough that a genuine
-# re-entry still shows up.
-ARRIVAL_DEBOUNCE_SECS = 60
-
-
-class ArrivalDebounce:
-    """
-    Collapses repeat arrivals for the same person within a short window.
-
-    A face reader can match twice in consecutive seconds, and the terminal
-    faithfully reports both. They are two real punches and both belong in the
-    database — it is only the announcement that should not be doubled.
-
-    Keyed on the punch's own timestamp rather than the clock, so draining a
-    backlog behaves like live traffic. Deliberately in memory: this is a
-    debounce, not the once-per-day guard. That one has to survive a restart,
-    which is why ROADMAP M5.2 puts it in SQLite instead.
-    """
-
-    def __init__(self, window_secs=ARRIVAL_DEBOUNCE_SECS):
-        self.window = datetime.timedelta(seconds=window_secs)
-        self._lock = threading.Lock()
-        self._last = {}         # (serial, user_id) -> datetime of last announce
-
-    def should_announce(self, serial, user_id, punched_utc):
-        """True if this arrival is far enough from the last one to be worth
-        saying out loud. An unparseable timestamp always announces: losing a
-        greeting is worse than repeating one."""
-        if not punched_utc:
-            return True
-        try:
-            when = datetime.datetime.strptime(punched_utc, "%Y-%m-%dT%H:%M:%SZ")
-        except ValueError:
-            return True
-        key = (serial, user_id)
-        with self._lock:
-            previous = self._last.get(key)
-            # abs() so an out-of-order upload cannot re-open the window.
-            if previous is not None and abs(when - previous) < self.window:
-                return False
-            self._last[key] = when
-            return True
-
-    def forget(self, serial, user_id):
-        """
-        Undo the last `should_announce` for this person.
-
-        Called when storing the punch failed: the device will re-send it, and
-        without this the retry would land inside the window and be discarded,
-        turning a transient write error into a permanently missing arrival.
-        """
-        with self._lock:
-            self._last.pop((serial, user_id), None)
-
-
 # --------------------------------------------------------------------------
-# Storage
+# Infino — the only place attendance is stored
 # --------------------------------------------------------------------------
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS devices (
-    serial          TEXT PRIMARY KEY,
-    first_seen_utc  TEXT NOT NULL,
-    last_seen_utc   TEXT NOT NULL,
-    last_event      TEXT,
-    contacts        INTEGER NOT NULL DEFAULT 0
-);
-
-CREATE TABLE IF NOT EXISTS punches (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    dedup_key       TEXT NOT NULL UNIQUE,
-    serial          TEXT NOT NULL,
-    user_id         TEXT NOT NULL,
-    punched_local   TEXT NOT NULL,
-    punched_utc     TEXT,
-    local_date      TEXT,
-    status          INTEGER,
-    verify          INTEGER,
-    workcode        TEXT,
-    raw             TEXT NOT NULL,
-    received_utc    TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS punches_person_day
-    ON punches (user_id, local_date);
-
--- One row per (punch, sink). Adding a sink later (e.g. the good-morning
--- greeter) means writing an extra row here, not changing the device path.
-CREATE TABLE IF NOT EXISTS outbox (
-    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    punch_id          INTEGER NOT NULL REFERENCES punches(id),
-    sink              TEXT NOT NULL,
-    dedup_key         TEXT NOT NULL,
-    payload           TEXT NOT NULL,
-    state             TEXT NOT NULL DEFAULT 'pending',
-    attempts          INTEGER NOT NULL DEFAULT 0,
-    next_attempt_utc  TEXT NOT NULL,
-    last_error        TEXT,
-    created_utc       TEXT NOT NULL,
-    delivered_utc     TEXT,
-    UNIQUE (dedup_key, sink)
-);
-CREATE INDEX IF NOT EXISTS outbox_ready
-    ON outbox (state, next_attempt_utc);
-
--- The terminal's own user roster, captured by the one-off /users/sync dump.
--- This is what you copy out to build the identity file that adds each
--- person's Slack and GitHub handles, so nothing here is invented — every
--- column is a field the device actually sent.
---
--- No password column: `Passwd` is a credential that unlocks a door, so only
--- whether one is set is recorded.
-CREATE TABLE IF NOT EXISTS device_users (
-    serial          TEXT NOT NULL,
-    user_id         TEXT NOT NULL,
-    name            TEXT,
-    privilege       INTEGER,
-    card            TEXT,
-    group_id        TEXT,
-    timezones       TEXT,
-    has_password    INTEGER NOT NULL DEFAULT 0,
-    raw             TEXT,
-    first_seen_utc  TEXT NOT NULL,
-    last_seen_utc   TEXT NOT NULL,
-    PRIMARY KEY (serial, user_id)
-);
-
--- Non-attendance uploads (OPERLOG door events, options replies, ...). Kept
--- capped and raw so door-event work later has real samples to build on.
-CREATE TABLE IF NOT EXISTS uploads (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    serial        TEXT NOT NULL,
-    table_name    TEXT,
-    body          TEXT NOT NULL,
-    received_utc  TEXT NOT NULL
-);
-"""
-
-
-class Store:
-    """
-    SQLite persistence. One connection per thread (handlers run concurrently),
-    WAL so the delivery worker's writes don't block device requests.
-    """
-
-    def __init__(self, path):
-        self.path = path
-        parent = os.path.dirname(os.path.abspath(path))
-        os.makedirs(parent, exist_ok=True)
-        self._local = threading.local()
-        conn = self._connect()
-        try:
-            conn.executescript(SCHEMA)
-            self._migrate(conn)
-            conn.commit()
-        finally:
-            conn.close()
-
-    @staticmethod
-    def _migrate(conn):
-        """
-        Bring an older database up to the current column names.
-
-        `pin` became `user_id` once it was clear the device sends a User ID and
-        not a secret. The stored values never changed, so renaming in place is
-        right — recreating the table would cost a day of attendance to fix a
-        label. Runs after the schema script, which is a no-op for a table that
-        already exists; SQLite carries indexes across a column rename.
-        """
-        for table in ("punches", "device_users"):
-            cols = {r["name"] for r in
-                    conn.execute(f"PRAGMA table_info({table})")}
-            if "pin" in cols and "user_id" not in cols:
-                conn.execute(
-                    f"ALTER TABLE {table} RENAME COLUMN pin TO user_id")
-                LOG.info("migrated %s.pin to %s.user_id", table, table)
-
-    def _connect(self):
-        conn = sqlite3.connect(self.path, timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=FULL")   # a punch must survive a crash
-        conn.execute("PRAGMA busy_timeout=10000")
-        conn.execute("PRAGMA foreign_keys=ON")
-        return conn
-
-    @property
-    def conn(self):
-        c = getattr(self._local, "conn", None)
-        if c is None:
-            c = self._connect()
-            self._local.conn = c
-        return c
-
-    # ---- writes --------------------------------------------------------
-    def note_contact(self, serial, event):
-        now = _iso(_utcnow())
-        with self.conn as conn:
-            conn.execute(
-                """INSERT INTO devices (serial, first_seen_utc, last_seen_utc,
-                                        last_event, contacts)
-                   VALUES (?, ?, ?, ?, 1)
-                   ON CONFLICT(serial) DO UPDATE SET
-                       last_seen_utc = excluded.last_seen_utc,
-                       last_event    = excluded.last_event,
-                       contacts      = contacts + 1""",
-                (serial, now, now, event))
-
-    def record_punch(self, punch, sinks, tz_name, arrival=None):
-        """
-        Store a punch and queue it for every sink, atomically.
-
-        Returns True if this punch was new, False if it was a re-upload we have
-        already accepted. Either way the device gets an OK — the whole point of
-        the dedup key is that a retry is harmless.
-
-        `arrival` is the row built by the caller when this punch counts as
-        someone showing up, and None otherwise (a departure, or a repeat inside
-        the debounce window). It rides the same transaction as the punch, so
-        there is no window where a punch is stored but its arrival is lost.
-        """
-        attendance_row = json.dumps(punch.payload(tz_name),
-                                    separators=(",", ":"))
-        arrival_row = (json.dumps(arrival, separators=(",", ":"))
-                       if arrival else None)
-        now = _iso(_utcnow())
-        with self.conn as conn:
-            cur = conn.execute(
-                """INSERT OR IGNORE INTO punches
-                       (dedup_key, serial, user_id, punched_local, punched_utc,
-                        local_date, status, verify, workcode, raw, received_utc)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (punch.dedup_key, punch.serial, punch.user_id,
-                 punch.punched_local,
-                 punch.punched_utc or None, punch.local_date or None,
-                 punch.status, punch.verify, punch.workcode, punch.raw,
-                 punch.received_utc))
-            if cur.rowcount == 0:
-                return False
-            punch_id = cur.lastrowid
-            for sink in sinks:
-                row = arrival_row if sink in ARRIVAL_SINKS else attendance_row
-                if row is None:
-                    continue          # an arrival sink, and this is not one
-                conn.execute(
-                    """INSERT OR IGNORE INTO outbox
-                           (punch_id, sink, dedup_key, payload, state,
-                            next_attempt_utc, created_utc)
-                       VALUES (?,?,?,?, 'pending', ?, ?)""",
-                    (punch_id, sink, punch.dedup_key, row, now, now))
-        return True
-
-    def record_device_user(self, serial, fields, raw):
-        """
-        Upsert one person from a USER record.
-
-        A field the device omitted leaves the stored value alone: DATA QUERY
-        replies and OPERLOG pushes carry different subsets on some firmware,
-        and a partial record must not blank out a name we already have.
-
-        `raw` is kept for the fields we did not model, and is scrubbed here
-        rather than by the caller — `fields` has already yielded everything we
-        want from the password, so the line itself must not carry it into the
-        database.
-        """
-        now = _iso(_utcnow())
-
-        def _int(name):
-            try:
-                return int(fields[name])
-            except (KeyError, TypeError, ValueError):
-                return None
-
-        password = fields.get("Passwd") or fields.get("PW") or ""
-        with self.conn as conn:
-            conn.execute(
-                """INSERT INTO device_users
-                       (serial, user_id, name, privilege, card, group_id,
-                        timezones, has_password, raw, first_seen_utc,
-                        last_seen_utc)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(serial, user_id) DO UPDATE SET
-                       name         = COALESCE(excluded.name, name),
-                       privilege    = COALESCE(excluded.privilege, privilege),
-                       card         = COALESCE(excluded.card, card),
-                       group_id     = COALESCE(excluded.group_id, group_id),
-                       timezones    = COALESCE(excluded.timezones, timezones),
-                       has_password = excluded.has_password,
-                       raw          = excluded.raw,
-                       last_seen_utc = excluded.last_seen_utc""",
-                (serial, fields["PIN"], fields.get("Name") or None, _int("Pri"),
-                 fields.get("Card") or None, fields.get("Grp") or None,
-                 fields.get("TZ") or None, 1 if password.strip() else 0,
-                 scrub_secrets(raw)[:512], now, now))
-
-    def record_upload(self, serial, table_name, body):
-        with self.conn as conn:
-            conn.execute(
-                """INSERT INTO uploads (serial, table_name, body, received_utc)
-                   VALUES (?,?,?,?)""",
-                (serial, table_name, body[:8192], _iso(_utcnow())))
-
-    # ---- outbox --------------------------------------------------------
-    def ready_outbox(self, limit=50):
-        return self.conn.execute(
-            """SELECT id, sink, dedup_key, payload, attempts
-                 FROM outbox
-                WHERE state = 'pending' AND next_attempt_utc <= ?
-                ORDER BY id
-                LIMIT ?""",
-            (_iso(_utcnow()), limit)).fetchall()
-
-    def mark_delivered(self, row_ids):
-        """Mark a whole batch delivered in one transaction — an Infino append
-        is atomic, so the rows succeed or fail together."""
-        now = _iso(_utcnow())
-        with self.conn as conn:
-            conn.executemany(
-                """UPDATE outbox
-                      SET state='delivered', delivered_utc=?, attempts=attempts+1,
-                          last_error=NULL
-                    WHERE id=?""", [(now, rid) for rid in row_ids])
-
-    def mark_retry(self, row_id, error, delay_secs):
-        nxt = _iso(_utcnow() + datetime.timedelta(seconds=delay_secs))
-        with self.conn as conn:
-            conn.execute(
-                """UPDATE outbox
-                      SET attempts=attempts+1, last_error=?, next_attempt_utc=?
-                    WHERE id=?""", (error[:500], nxt, row_id))
-
-    def mark_dead(self, row_id, error):
-        with self.conn as conn:
-            conn.execute(
-                """UPDATE outbox
-                      SET state='dead', attempts=attempts+1, last_error=?
-                    WHERE id=?""", (error[:500], row_id))
-
-    # ---- reads ---------------------------------------------------------
-    def stats(self):
-        counts = {r["state"]: r["n"] for r in self.conn.execute(
-            "SELECT state, COUNT(*) AS n FROM outbox GROUP BY state")}
-        punches = self.conn.execute(
-            "SELECT COUNT(*) AS n FROM punches").fetchone()["n"]
-        return {"punches": punches,
-                "outbox_pending": counts.get("pending", 0),
-                "outbox_delivered": counts.get("delivered", 0),
-                "outbox_dead": counts.get("dead", 0)}
-
-    def devices(self):
-        return self.conn.execute(
-            """SELECT serial, first_seen_utc, last_seen_utc, last_event, contacts
-                 FROM devices ORDER BY last_seen_utc DESC""").fetchall()
-
-    def recent_punches(self, limit=20):
-        return self.conn.execute(
-            """SELECT user_id, punched_local, punched_utc, status, verify,
-                      serial
-                 FROM punches ORDER BY id DESC LIMIT ?""",
-            (max(1, min(500, limit)),)).fetchall()
-
-    def pending_delivery(self):
-        """
-        How many rows are still queued for the cloud.
-
-        Attendance is read from Infino, so anything still sitting here is a
-        gap in what a reader will see. Reporting it beats letting a caller
-        conclude that a person simply did not turn up.
-        """
-        return self.conn.execute(
-            "SELECT COUNT(*) AS n FROM outbox WHERE state = 'pending'"
-        ).fetchone()["n"]
-
-    def device_users(self, serial=None):
-        """The roster, ordered by user ID numerically where it is a number."""
-        where = "WHERE serial = ?" if serial else ""
-        params = (serial,) if serial else ()
-        return self.conn.execute(f"""
-            SELECT serial, user_id, name, privilege, card, group_id, timezones,
-                   has_password, first_seen_utc, last_seen_utc
-              FROM device_users {where}
-             ORDER BY CAST(user_id AS INTEGER), user_id
-        """, params).fetchall()
-
-
-# --------------------------------------------------------------------------
-# Sinks
-# --------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class DeliveryResult:
-    ok: bool
-    permanent: bool = False     # don't retry: the request itself is wrong
-    error: str = ""
-    retry_after: float = 0.0    # honour a server-supplied Retry-After
-
-
-# The attendance table as Infino will hold it. Kept beside Punch.payload(),
-# which must produce exactly these column names.
 #
-# No fts or vector index is declared: every question we ask of this table
-# ("what did user 12 do today?") is a SQL predicate, which /v1/query_sql answers
-# without one. Adding a full-text or embedding index later is a deliberate
-# schema change, not something to guess at now.
+# There is no local database. A punch is acknowledged to the terminal only
+# once Infino has accepted it, which makes the device's own buffer the retry
+# mechanism: refuse the upload and it keeps the records and offers them again.
+# The trade is deliberate — no attendance data at rest on this machine, at the
+# cost of the device's poll loop depending on the cloud being reachable.
+
+# The attendance table as Infino holds it. Kept beside Punch.payload(), which
+# must produce exactly these column names.
 INFINO_TABLE_SCHEMA = [
     {"name": "event_id", "type": "large_utf8", "nullable": False},
     {"name": "schema_version", "type": "large_utf8"},
@@ -1358,13 +1001,9 @@ INFINO_TABLE_SCHEMA = [
     {"name": "source", "type": "large_utf8"},
 ]
 
-# One row per announced arrival, with identity denormalised onto it. Kept
-# beside arrival_payload(), which must produce exactly these column names.
-#
-# `person_name` rather than `name` because the schema descriptors themselves
-# use a "name" key — a column called "name" reads as a mistake here.
-# Everything except event_id is nullable: an unmapped user arrives with no
-# name at all, and a person may genuinely have no GitHub account.
+# One row per person per day: the first time they were seen. This table is
+# also the greeting ledger — its existence for (user, day) is what says
+# "already greeted", so it must be written exactly when a greeting is issued.
 INFINO_ARRIVALS_SCHEMA = [
     {"name": "event_id", "type": "large_utf8", "nullable": False},
     {"name": "schema_version", "type": "large_utf8"},
@@ -1385,70 +1024,84 @@ INFINO_ARRIVALS_SCHEMA = [
     {"name": "source", "type": "large_utf8"},
 ]
 
+# The terminal's roster, captured by the one-off /users/sync. Append-only, so
+# a re-sync adds rows and the newest `synced_at` per (serial, user_id) wins.
+INFINO_USERS_SCHEMA = [
+    {"name": "device_serial", "type": "large_utf8", "nullable": False},
+    {"name": "employee_user_id", "type": "large_utf8", "nullable": False},
+    {"name": "person_name", "type": "large_utf8"},
+    {"name": "privilege", "type": "i32"},
+    {"name": "privilege_label", "type": "large_utf8"},
+    {"name": "card", "type": "large_utf8"},
+    {"name": "group_id", "type": "large_utf8"},
+    {"name": "timezones", "type": "large_utf8"},
+    {"name": "has_password", "type": "i32"},
+    {"name": "synced_at", "type": "large_utf8"},
+    {"name": "source", "type": "large_utf8"},
+]
 
-class LogSink:
+
+class InfinoError(Exception):
     """
-    Writes rows to the log. The dry-run target: ZK_SINKS=log exercises the
-    whole outbox path with no cloud account, and 'log_arrivals' does the same
-    for arrival rows so their shape can be checked before a key exists.
-    """
+    A call to Infino failed.
 
-    def __init__(self, name="log"):
-        self.name = name
-
-    def deliver(self, rows):
-        for row in rows:
-            LOG.info("[%s] %s", self.name, row["payload"])
-        return DeliveryResult(ok=True)
-
-
-class InfinoSink:
-    """
-    Appends punches as rows to a table in Infino Cloud.
-
-    Infino is a retrieval engine, not an event bus: a database and a table have
-    to exist before any append, and there is no idempotency key. Two
-    consequences shape this class.
-
-    First, bootstrap. We create the database and table on first use and
-    whenever an append reports 404, because "table missing" is recoverable —
-    unlike a malformed row.
-
-    Second, duplicates. Our outbox guarantees each punch is *sent* once, but if
-    a response is lost after Infino committed the append, the retry appends the
-    row twice. Every row therefore carries `event_id`, so readers can dedup
-    (`SELECT ... GROUP BY event_id`). Closing that window properly means
-    checking for the row before retrying an ambiguous failure — ROADMAP M3.6.
+    `permanent` distinguishes "this request will never work" (a malformed row,
+    a schema mismatch) from "try again" (network, timeout, cold start). With
+    no outbox, that distinction decides whether the terminal is told to keep
+    the record or the record is dropped.
     """
 
-    def __init__(self, cfg, name, table, table_schema):
-        self.name = name
+    def __init__(self, message, status=502, permanent=False, retry_after=0.0):
+        super().__init__(message)
+        self.status = status
+        self.permanent = permanent
+        self.retry_after = retry_after
+
+
+class InfinoClient:
+    """
+    Both halves of Infino: `/v1/append/{db}` to write, `/v1/query_sql/{db}` to
+    read, plus the bootstrap that creates the database and tables.
+
+    Reads come back as a plain JSON array of row objects when we ask for
+    `Accept: application/json` — the default is an Arrow IPC stream, which
+    would mean a pyarrow dependency to read our own attendance. A NULL column
+    is *omitted* from the row object rather than returned as null, so callers
+    use .get() throughout.
+
+    Appends are eventually consistent: measured at roughly half a second
+    before a written row is visible to a query. Anything that needs to know
+    "did I just write this?" cannot rely on a read (see GreetingGuard).
+    """
+
+    def __init__(self, cfg):
         self.base = cfg.infino_url
         self.database = cfg.infino_database
-        self.table = table
-        self.table_schema = table_schema
         self.api_key = cfg.infino_api_key
         self.timeout = cfg.infino_timeout
         self.autocreate = cfg.infino_bootstrap
-        self._bootstrapped = False
+        self.batch_rows = cfg.infino_batch_rows
+        self._bootstrapped = set()
         self._lock = threading.Lock()
 
+    @property
+    def configured(self):
+        return bool(self.database and self.api_key)
+
     # ---- HTTP ----------------------------------------------------------
-    def _post(self, path, body, query=""):
-        """
-        POST JSON to an Infino path. Returns (status, parsed_body_or_text).
-        Raises nothing the caller has to catch except transport errors, which
-        are translated into DeliveryResult by the callers below.
-        """
-        url = f"{self.base}{path}" + (f"?{query}" if query else "")
-        data = json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(url, data=data, method="POST")
+    def _request(self, path, body, params=None, accept_json=False):
+        url = f"{self.base}{path}"
+        if params:
+            url += "?" + urlencode(params)
+        req = urllib.request.Request(
+            url, data=json.dumps(body).encode("utf-8"), method="POST")
         req.add_header("Content-Type", "application/json")
         req.add_header("Authorization", f"Bearer {self.api_key}")
         req.add_header("User-Agent", USER_AGENT)
+        if accept_json:
+            req.add_header("Accept", "application/json")
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            raw = resp.read(4096).decode("utf-8", "replace")
-            return resp.status, raw
+            return resp.status, resp.read()
 
     @staticmethod
     def _describe(err):
@@ -1465,315 +1118,224 @@ class InfinoSink:
             pass
         return f"HTTP {err.code}: {detail.strip()[:300]}"
 
-    @staticmethod
-    def _retry_after(err):
+    def _call(self, path, body, params=None, accept_json=False):
+        """Translate every failure mode into one InfinoError."""
+        if not self.configured:
+            raise InfinoError(
+                "Infino is not configured: set ZK_INFINO_DATABASE and "
+                "ZK_INFINO_API_KEY. Attendance is stored only in Infino, so "
+                "there is nowhere for a punch to go without them.", 503)
         try:
-            return max(0.0, float(err.headers.get("Retry-After", 0) or 0))
-        except (TypeError, ValueError):
-            return 0.0
-
-    # ---- bootstrap -----------------------------------------------------
-    def ensure_ready(self):
-        """
-        Create the database and table if they don't exist.
-
-        Idempotent and best-effort: 409 means someone got there first, which is
-        success. A failure here is logged but never raised — punches keep
-        accumulating in the outbox and the next delivery attempt retries this.
-        """
-        with self._lock:
-            if self._bootstrapped or not self.autocreate:
-                return self._bootstrapped
-            try:
-                try:
-                    self._post("/v1/databases", {"name": self.database})
-                    LOG.info("created Infino database %r", self.database)
-                except urllib.error.HTTPError as e:
-                    if e.code != 409:
-                        raise
-                    LOG.debug("Infino database %r already exists",
-                              self.database)
-                try:
-                    self._post(f"/v1/create_table/{self.database}",
-                               {"table_name": self.table,
-                                "schema": self.table_schema})
-                    LOG.info("created Infino table %r in %r",
-                             self.table, self.database)
-                except urllib.error.HTTPError as e:
-                    if e.code != 409:
-                        raise
-                    LOG.debug("Infino table %r already exists", self.table)
-                self._bootstrapped = True
-            except urllib.error.HTTPError as e:
-                LOG.error("Infino bootstrap failed: %s", self._describe(e))
-            except Exception as e:
-                LOG.error("Infino bootstrap failed: %s: %s",
-                          type(e).__name__, e)
-            return self._bootstrapped
-
-    # ---- delivery ------------------------------------------------------
-    def deliver(self, rows):
-        """
-        Append a batch of rows. One append is one atomic commit, so the whole
-        batch shares a fate — which is why the worker retries a rejected batch
-        row by row to find the poison record.
-        """
-        self.ensure_ready()
-        data = [json.loads(r["payload"]) for r in rows]
-        try:
-            status, _ = self._post(f"/v1/append/{self.database}",
-                                   {"data": data},
-                                   query=f"table={self.table}")
-            if 200 <= status < 300:
-                return DeliveryResult(ok=True)
-            return DeliveryResult(ok=False,
-                                  error=f"unexpected status {status}")
+            return self._request(path, body, params, accept_json)
         except urllib.error.HTTPError as e:
             desc = self._describe(e)
             if e.code == 404:
-                # Database or table is missing — recoverable, so re-bootstrap
-                # and let the normal backoff bring this batch back.
+                # Database or table missing — recoverable once re-created.
                 with self._lock:
-                    self._bootstrapped = False
-                LOG.warning("Infino reported 404; will re-create the database "
-                            "and table on the next attempt (%s)", desc)
-                return DeliveryResult(ok=False, error=desc)
-            if e.code == 503:
-                # Documented cold start: the request did not run.
-                return DeliveryResult(ok=False, error=desc,
-                                      retry_after=self._retry_after(e))
-            if e.code == 413:
-                # Batch too large. Splitting is the fix, and the worker does
-                # that on any permanent error, so this resolves itself.
-                return DeliveryResult(ok=False, permanent=True, error=desc)
-            permanent = 400 <= e.code < 500 and e.code not in (408, 429)
-            return DeliveryResult(ok=False, permanent=permanent, error=desc,
-                                  retry_after=self._retry_after(e))
-        except urllib.error.URLError as e:
-            return DeliveryResult(ok=False, error=f"network: {e.reason}")
-        except TimeoutError:
-            return DeliveryResult(ok=False, error="timeout")
-        except Exception as e:                       # never kill the worker
-            return DeliveryResult(ok=False, error=f"{type(e).__name__}: {e}")
-
-
-class InfinoQueryError(Exception):
-    """A read from Infino failed. Carries an HTTP status to hand back."""
-
-    def __init__(self, message, status=502):
-        super().__init__(message)
-        self.status = status
-
-
-class InfinoQuery:
-    """
-    Read side of Infino: `POST /v1/query_sql/{database}` with `{"query": …}`.
-
-    SQL is read-only there by design, the dialect is Apache DataFusion
-    (Postgres-leaning, with CTEs, JOINs, GROUP BY and window functions), and
-    with `Accept: application/json` the body comes back as a plain array of
-    row objects:
-
-        [{"employee_user_id": "9", "punched_at_local": "2026-08-09 16:30:45"}]
-
-    Two things that shape every caller: a NULL column is *omitted* from the
-    row object rather than returned as null, so reads must use .get(); and
-    Infino has no idempotency on append, so a retry after an ambiguous failure
-    can write a row twice — every query here dedups on `event_id` (M3.6).
-    """
-
-    def __init__(self, cfg):
-        self.base = cfg.infino_url
-        self.database = cfg.infino_database
-        self.api_key = cfg.infino_api_key
-        self.timeout = cfg.infino_timeout
-
-    @property
-    def configured(self):
-        return bool(self.database and self.api_key)
-
-    def rows(self, sql):
-        """Run a query and return a list of dicts. Raises InfinoQueryError."""
-        if not self.configured:
-            raise InfinoQueryError(
-                "Infino is not configured: set ZK_INFINO_DATABASE and "
-                "ZK_INFINO_API_KEY. Attendance is read from the cloud, so "
-                "there is nothing to serve without them.", 503)
-        url = f"{self.base}/v1/query_sql/{self.database}"
-        req = urllib.request.Request(
-            url, data=json.dumps({"query": sql}).encode("utf-8"), method="POST")
-        req.add_header("Content-Type", "application/json")
-        # Without this the response is an Arrow IPC stream, which would mean
-        # taking a dependency on pyarrow to read our own attendance.
-        req.add_header("Accept", "application/json")
-        req.add_header("Authorization", f"Bearer {self.api_key}")
-        req.add_header("User-Agent", USER_AGENT)
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                body = resp.read()
-        except urllib.error.HTTPError as e:
-            detail = InfinoSink._describe(e)
-            if e.code == 503:
-                # Documented cold start: the database is spinning up.
-                raise InfinoQueryError(
-                    f"Infino is starting up, retry shortly ({detail})", 503)
+                    self._bootstrapped.clear()
+                raise InfinoError(desc, 502)
             if e.code == 401:
-                raise InfinoQueryError("Infino rejected the API key", 502)
-            raise InfinoQueryError(detail, 502)
+                raise InfinoError(f"Infino rejected the API key ({desc})", 502)
+            if e.code == 503:
+                try:
+                    wait = float(e.headers.get("Retry-After", 0) or 0)
+                except (TypeError, ValueError):
+                    wait = 0.0
+                raise InfinoError(f"Infino is starting up ({desc})", 503,
+                                  retry_after=wait)
+            permanent = 400 <= e.code < 500 and e.code not in (408, 429)
+            raise InfinoError(desc, 502, permanent=permanent)
         except urllib.error.URLError as e:
-            raise InfinoQueryError(f"cannot reach Infino: {e.reason}", 502)
+            raise InfinoError(f"cannot reach Infino: {e.reason}", 502)
         except TimeoutError:
-            raise InfinoQueryError("Infino timed out", 504)
+            raise InfinoError("Infino timed out", 504)
+
+    # ---- bootstrap -----------------------------------------------------
+    def ensure_ready(self, tables):
+        """
+        Create the database and the given {table: schema} if absent.
+
+        Idempotent: 409 means someone got there first, which is success. Safe
+        to call on every append — the work is skipped once a table is known
+        good, and a 404 clears that memory so the next call rebuilds.
+        """
+        if not self.autocreate or not self.configured:
+            return
+        with self._lock:
+            missing = {t: s for t, s in tables.items()
+                       if t not in self._bootstrapped}
+        if not missing:
+            return
+        try:
+            self._call("/v1/databases", {"name": self.database})
+            LOG.info("created Infino database %r", self.database)
+        except InfinoError as e:
+            if "409" not in str(e):
+                LOG.debug("database create returned: %s", e)
+        for table, schema in missing.items():
+            try:
+                self._call(f"/v1/create_table/{self.database}",
+                           {"table_name": table, "schema": schema})
+                LOG.info("created Infino table %r in %r", table, self.database)
+            except InfinoError as e:
+                if "409" not in str(e):
+                    LOG.debug("table %s create returned: %s", table, e)
+            with self._lock:
+                self._bootstrapped.add(table)
+
+    # ---- write ---------------------------------------------------------
+    def append(self, table, rows):
+        """
+        Append rows to a table. One append is one atomic commit, so the batch
+        succeeds or fails together. Raises InfinoError.
+        """
+        if not rows:
+            return 0
+        for batch in _chunked(rows, self.batch_rows):
+            status, _ = self._call(f"/v1/append/{self.database}",
+                                   {"data": batch}, {"table": table})
+            if not 200 <= status < 300:
+                raise InfinoError(f"unexpected status {status} appending to "
+                                  f"{table}")
+        return len(rows)
+
+    # ---- read ----------------------------------------------------------
+    def rows(self, sql):
+        """Run a read-only query and return a list of row dicts."""
+        _status, body = self._call(f"/v1/query_sql/{self.database}",
+                                   {"query": sql}, accept_json=True)
         try:
             parsed = json.loads(body)
         except ValueError:
-            raise InfinoQueryError("Infino returned a non-JSON body", 502)
+            raise InfinoError("Infino returned a non-JSON body", 502)
         if not isinstance(parsed, list):
-            raise InfinoQueryError(
+            raise InfinoError(
                 f"expected a JSON array of rows, got {type(parsed).__name__}",
                 502)
         return parsed
 
 
-def build_sinks(cfg):
-    """
-    One sink object per configured name.
-
-    Both Infino sinks are the same class pointed at different tables, so the
-    retry, batching, bootstrap and dead-letter behaviour is shared rather than
-    reimplemented for arrivals.
-    """
-    tables = {"infino": (cfg.infino_table, INFINO_TABLE_SCHEMA),
-              "infino_arrivals": (cfg.infino_arrivals_table,
-                                  INFINO_ARRIVALS_SCHEMA)}
-    sinks = {}
-    for name in cfg.sinks:
-        if name in tables:
-            table, schema = tables[name]
-            sinks[name] = InfinoSink(cfg, name, table, schema)
-        else:
-            sinks[name] = LogSink(name)
-    return sinks
+def _chunked(rows, size):
+    for i in range(0, len(rows), max(1, size)):
+        yield rows[i:i + size]
 
 
-class DeliveryWorker(threading.Thread):
+class Publisher:
     """
-    Drains the outbox. Single-threaded on purpose: ordering per person is
-    easier to reason about, and the volume (a few hundred punches a day) is
-    nowhere near needing concurrency.
+    Sends rows to their destination, synchronously, on the request thread.
+
+    `ZK_SINKS` decides where each kind goes: 'infino'/'infino_arrivals' append
+    to the cloud, 'log'/'log_arrivals' only print — the dry run that needs no
+    account. A row can go to both.
+
+    Transient failures propagate, so the caller can refuse to acknowledge the
+    upload and let the terminal keep the records. A row Infino permanently
+    rejects is logged in full at ERROR and dropped: with no queue to park it
+    in, the alternative is refusing the batch forever and blocking every punch
+    behind it.
     """
 
-    def __init__(self, cfg, store, sinks, stop_event):
-        super().__init__(name="delivery", daemon=True)
+    def __init__(self, cfg, client):
         self.cfg = cfg
-        self.store = store
-        self.sinks = sinks
-        self.stop = stop_event
-        self.delivered = 0
-        self.failed = 0
-        self.last_success_utc = None
+        self.client = client
+        self.dropped = 0
+        self.appended = 0
 
-    def _backoff(self, attempts):
-        raw = self.cfg.retry_base_secs * (2 ** min(attempts, 12))
-        capped = min(raw, self.cfg.retry_cap_secs)
-        return capped * (0.5 + random.random())      # jitter: avoid lockstep
-
-    def _chunks(self, rows):
-        """
-        Split rows into batches within Infino's per-request budget. Punch rows
-        are a few hundred bytes, so the row count is what normally binds; the
-        byte budget only matters when draining a long backlog.
-        """
-        batch, size = [], 0
-        for row in rows:
-            n = len(row["payload"])
-            if batch and (len(batch) >= self.cfg.infino_batch_rows
-                          or size + n > self.cfg.infino_batch_bytes):
-                yield batch
-                batch, size = [], 0
-            batch.append(row)
-            size += n
-        if batch:
-            yield batch
-
-    def run(self):
-        LOG.info("delivery worker started (sinks: %s)",
-                 ", ".join(sorted(self.sinks)))
-        while not self.stop.is_set():
-            try:
-                rows = self.store.ready_outbox(
-                    limit=max(self.cfg.infino_batch_rows * 2, 100))
-            except Exception:
-                LOG.exception("outbox read failed")
-                self.stop.wait(self.cfg.worker_poll_secs)
-                continue
-            if not rows:
-                self.stop.wait(self.cfg.worker_poll_secs)
-                continue
-            by_sink = {}
+    def _emit(self, cloud_sink, log_sink, table, rows, kind):
+        if not rows:
+            return
+        if log_sink in self.cfg.sinks:
             for row in rows:
-                by_sink.setdefault(row["sink"], []).append(row)
-            for sink_name, sink_rows in by_sink.items():
-                for batch in self._chunks(sink_rows):
-                    if self.stop.is_set():
-                        break
-                    self._deliver_batch(sink_name, batch)
-        LOG.info("delivery worker stopped")
-
-    def _deliver_batch(self, sink_name, batch):
-        sink = self.sinks.get(sink_name)
-        if sink is None:
-            # Sink was removed from config while rows for it were pending.
-            for row in batch:
-                self.store.mark_retry(row["id"],
-                                      f"sink {sink_name} not enabled",
-                                      self.cfg.retry_cap_secs)
+                LOG.info("[%s] %s", log_sink,
+                         json.dumps(row, separators=(",", ":")))
+        if cloud_sink not in self.cfg.sinks:
             return
+        try:
+            self.client.append(table, rows)
+            self.appended += len(rows)
+        except InfinoError as e:
+            if not e.permanent:
+                raise
+            if len(rows) > 1:
+                # The batch is atomic, so a rejection says nothing about which
+                # row was at fault. Re-send singly to isolate the bad one.
+                LOG.warning("Infino rejected a batch of %d %s rows (%s); "
+                            "retrying individually to isolate it",
+                            len(rows), kind, e)
+                for row in rows:
+                    self._emit(cloud_sink, log_sink, table, [row], kind)
+                return
+            self.dropped += 1
+            LOG.error("DROPPED %s row, Infino rejected it permanently (%s): %s",
+                      kind, e, json.dumps(rows[0], separators=(",", ":")))
 
-        result = sink.deliver(batch)
-        if result.ok:
-            self.store.mark_delivered([r["id"] for r in batch])
-            self.delivered += len(batch)
-            self.last_success_utc = _iso(_utcnow())
-            LOG.info("delivered %d row(s) -> %s [%s]", len(batch), sink_name,
-                     ", ".join(r["dedup_key"][:12] for r in batch[:3])
-                     + (", ..." if len(batch) > 3 else ""))
-            return
+    def publish_attendance(self, rows):
+        self._emit("infino", "log", self.cfg.infino_table, rows, "attendance")
 
-        # An append is atomic, so a rejected batch tells us nothing about which
-        # row was at fault. Re-send them one at a time so a single bad record
-        # gets dead-lettered instead of blocking everyone behind it.
-        if result.permanent and len(batch) > 1:
-            LOG.warning("batch of %d rejected by %s (%s); retrying "
-                        "individually to isolate the bad row",
-                        len(batch), sink_name, result.error)
-            for row in batch:
-                self._deliver_batch(sink_name, [row])
-            return
+    def publish_arrivals(self, rows):
+        self._emit("infino_arrivals", "log_arrivals",
+                   self.cfg.infino_arrivals_table, rows, "arrival")
 
-        for row in batch:
-            self._fail_row(row, sink_name, result)
+    def publish_users(self, rows):
+        self._emit("infino", "log", self.cfg.infino_users_table, rows, "user")
 
-    def _fail_row(self, row, sink_name, result):
-        self.failed += 1
-        attempts = row["attempts"] + 1
-        key = row["dedup_key"][:12]
-        if result.permanent:
-            self.store.mark_dead(row["id"], result.error)
-            LOG.error("permanent failure for %s -> %s: %s (dead-lettered)",
-                      key, sink_name, result.error)
-        elif attempts >= self.cfg.max_attempts:
-            self.store.mark_dead(row["id"], result.error)
-            LOG.error("giving up on %s -> %s after %d attempts: %s",
-                      key, sink_name, attempts, result.error)
-        else:
-            # A server-supplied Retry-After beats our guess — Infino sends one
-            # on the 503 it returns while an idle database is starting up.
-            delay = result.retry_after or self._backoff(attempts)
-            self.store.mark_retry(row["id"], result.error, delay)
-            LOG.warning("delivery of %s -> %s failed (attempt %d/%d), retry in "
-                        "%.0fs: %s", key, sink_name, attempts,
-                        self.cfg.max_attempts, delay, result.error)
+
+class GreetingGuard:
+    """
+    Has this person already been greeted today?
+
+    The durable answer is the arrivals table itself: one row per person per
+    day means "a row exists" *is* "already greeted", and it survives a restart
+    or a device re-upload without any local state.
+
+    A short-lived local set sits in front of it, because a query cannot answer
+    the one case that matters most here: an append takes roughly half a second
+    to become visible, and this terminal reports the same face twice one
+    second apart. The set closes that window; Infino closes the long ones.
+
+    Checking and marking are one locked operation, so two concurrent uploads
+    for the same person cannot both decide they are first.
+    """
+
+    def __init__(self, client, table, keep_days=7):
+        self.client = client
+        self.table = table
+        self.keep_days = keep_days
+        self._lock = threading.Lock()
+        self._seen = {}                 # local_date -> {user_id, ...}
+
+    def _remember(self, user_id, local_date):
+        day = self._seen.setdefault(local_date, set())
+        day.add(user_id)
+        # Bound the memory: only recent days can still be asked about.
+        for stale in sorted(self._seen)[:-self.keep_days]:
+            del self._seen[stale]
+
+    def claim(self, user_id, local_date):
+        """
+        True if this greeting is ours to send, and records it as sent.
+        False if the person has already been greeted today.
+
+        Raises InfinoError if the ledger cannot be read — failing closed, so
+        an unreachable cloud never causes a duplicate greeting.
+        """
+        with self._lock:
+            if user_id in self._seen.get(local_date, ()):
+                return False
+        rows = self.client.rows(
+            f"SELECT 1 AS hit FROM {self.table} "
+            f"WHERE employee_user_id = {_sql_text(user_id)} "
+            f"  AND local_date = {_sql_text(local_date)} LIMIT 1")
+        with self._lock:
+            if user_id in self._seen.get(local_date, ()):
+                return False            # another thread got there first
+            self._remember(user_id, local_date)
+            return not rows
+
+    def release(self, user_id, local_date):
+        """Undo a claim whose append then failed, so a retry can greet."""
+        with self._lock:
+            self._seen.get(local_date, set()).discard(user_id)
 
 
 # --------------------------------------------------------------------------
@@ -1884,13 +1446,12 @@ def _door_payload(door, seconds, cc="01", dd="00"):
 class Handler(BaseHTTPRequestHandler):
     # Injected by main(); class attributes keep the stdlib handler signature.
     cfg = None
-    store = None
     queue = None
     registry = None
-    worker = None
     directory = None
-    arrivals = None
-    query = None
+    infino = None
+    publisher = None
+    greetings = None
     started_at = time.monotonic()
 
     protocol_version = "HTTP/1.0"    # terminals don't benefit from keep-alive
@@ -1979,7 +1540,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def _note(self, serial, event):
         gap = self.registry.note(serial)
-        self.store.note_contact(serial, event)
         LOG.info("%-24s SN=%s %s", event, serial,
                  "(first contact)" if gap is None else f"(+{gap:.1f}s)")
 
@@ -2017,15 +1577,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_attlog(self, serial, body):
         """
-        Store an uploaded attendance batch.
+        Publish an uploaded attendance batch to Infino.
 
-        The reply must be `OK: <count>` where count is the number of records we
+        The reply must be `OK: <count>` where count is the number of records
         accepted; anything else and most firmware re-sends the whole batch on
-        its next transfer. We only send it after the rows are committed.
+        its next transfer. Nothing is acknowledged until Infino has the rows —
+        with no local store, the terminal's own buffer *is* the retry queue,
+        so a refused upload is how a punch survives a cloud outage.
+
+        Greetings are claimed before the append and released if it fails, so a
+        transient error cannot consume someone's one greeting for the day.
         """
         tz = ZoneInfo(self.cfg.device_tz)
         received = _iso(_utcnow())
-        accepted = new = malformed = 0
+        punches, malformed = [], 0
         for line in body.splitlines():
             if not line.strip():
                 continue
@@ -2035,66 +1600,72 @@ class Handler(BaseHTTPRequestHandler):
                 LOG.warning("unparseable ATTLOG line from SN=%s: %r",
                             serial, line[:200])
                 continue
-            # Decided before the write so the arrival row lands in the same
-            # transaction as the punch it describes.
-            arrival = self._arrival_for(punch)
-            try:
-                is_new = self.store.record_punch(punch, self.cfg.sinks,
-                                                 self.cfg.device_tz, arrival)
-            except Exception:
-                # Do NOT acknowledge what we failed to store — let the device
-                # keep the record and re-send it. Release the debounce too, or
-                # the re-send would be swallowed and the arrival lost for good.
-                if arrival:
-                    self.arrivals.forget(punch.serial, punch.user_id)
-                LOG.exception("failed to store punch from SN=%s", serial)
-                self._reply("storage error\n", 500)
-                return
-            accepted += 1
-            if is_new:
-                new += 1
-                LOG.info("PUNCH %s %s %s (%s via %s)",
-                         self._user_id_for_log(punch.user_id), punch.punched_local,
-                         punch.punched_utc or "?", punch.direction,
-                         VERIFY_METHOD.get(punch.verify, punch.verify))
-                if arrival:
-                    self._log_arrival(arrival)
-            else:
-                LOG.debug("duplicate punch ignored: %s", punch.dedup_key[:12])
+            punches.append(punch)
 
-        LOG.info("ATTLOG batch from SN=%s: %d accepted (%d new), %d malformed",
-                 serial, accepted, new, malformed)
-        # Count everything we consumed, malformed included: re-sending a line we
-        # cannot parse will not make it parseable, and stalling the device on it
-        # would block every later punch behind it.
-        self._reply(f"OK: {accepted + malformed}")
+        arrivals, claimed = [], []
+        try:
+            for punch in punches:
+                arrival = self._arrival_for(punch)
+                if arrival:
+                    arrivals.append(arrival)
+                    claimed.append((punch.user_id, punch.local_date))
+            self.publisher.publish_attendance(
+                [p.payload(self.cfg.device_tz) for p in punches])
+            self.publisher.publish_arrivals(arrivals)
+        except InfinoError as e:
+            # Hand the records back to the device rather than lose them.
+            for user_id, local_date in claimed:
+                self.greetings.release(user_id, local_date)
+            LOG.error("refusing ATTLOG batch from SN=%s, Infino unavailable: "
+                      "%s (the terminal will re-send)", serial, e)
+            self._reply(f"cloud unavailable: {e}\n", 503)
+            return
+
+        for punch in punches:
+            LOG.info("PUNCH %s %s %s (%s via %s)",
+                     self._user_id_for_log(punch.user_id), punch.punched_local,
+                     punch.punched_utc or "?", punch.direction,
+                     VERIFY_METHOD.get(punch.verify, punch.verify))
+        for arrival in arrivals:
+            self._log_arrival(arrival)
+
+        LOG.info("ATTLOG batch from SN=%s: %d published (%d arrival(s)), "
+                 "%d malformed", serial, len(punches), len(arrivals), malformed)
+        # Count everything consumed, malformed included: re-sending a line we
+        # cannot parse will not make it parseable, and stalling the device on
+        # it would block every later punch behind it.
+        self._reply(f"OK: {len(punches) + malformed}")
 
     # ---- arrivals ------------------------------------------------------
     def _arrival_for(self, punch):
         """
-        Decide whether this punch is someone showing up, and if so build the
-        row for it. Returns the payload, or None.
+        Decide whether this punch is someone showing up for the first time
+        today, and if so build the row for it. Returns the payload, or None.
 
         Anything that is not explicitly a departure counts as an arrival. Many
         terminals never report a direction at all — they send status 255 — so
         requiring an explicit check-in would mean never announcing anyone.
 
-        One decision, two consumers: the terminal line and the outbox row are
-        built from the same payload, so they cannot disagree about who arrived.
+        One decision, two consumers: the terminal line and the row written to
+        Infino come from the same payload, so they cannot disagree.
 
-        This is not yet the once-a-day greeting: a second arrival after lunch
-        counts again, subject only to the short debounce. First-punch-of-day
-        and its durable idempotency guard are ROADMAP M5.1 and M5.2.
+        Claiming the greeting here is what makes it once per person per day
+        (ROADMAP M5.1/M5.2): the arrivals table is the ledger, so a restart, a
+        device re-upload, and the reader matching the same face twice all
+        collapse to a single greeting.
         """
         if punch.status in DEPARTURE_STATUS:
             LOG.debug("no arrival for %s: direction is %s",
                       self._user_id_for_log(punch.user_id), punch.direction)
             return None
-        if not self.arrivals.should_announce(punch.serial, punch.user_id,
-                                             punch.punched_utc):
-            LOG.debug("arrival for %s already recorded within %ds",
-                      self._user_id_for_log(punch.user_id),
-                      ARRIVAL_DEBOUNCE_SECS)
+        if not punch.local_date:
+            LOG.warning("no arrival for %s: its timestamp was unparseable, so "
+                        "there is no day to key the greeting on",
+                        self._user_id_for_log(punch.user_id))
+            return None
+        if not self.greetings.claim(punch.user_id, punch.local_date):
+            LOG.debug("no arrival for %s: already greeted on %s",
+                      self._user_id_for_log(punch.user_id), punch.local_date)
             return None
         return arrival_payload(punch, self.directory.get(punch.user_id),
                                self.cfg.device_tz)
@@ -2217,19 +1788,19 @@ class Handler(BaseHTTPRequestHandler):
         direction = "DESC" if order == "desc" else "ASC"
 
         try:
-            total = self.query.rows(
+            total = self.infino.rows(
                 f"SELECT COUNT(*) AS n FROM (SELECT DISTINCT "
                 f"employee_user_id, local_date FROM "
                 f"{self.cfg.infino_table} {clause}) t")
-            rows = self.query.rows(
+            rows = self.infino.rows(
                 self._attendance_sql(clause, direction, limit + 1, offset))
-        except InfinoQueryError as e:
+        except InfinoError as e:
             LOG.warning("attendance query failed: %s", e)
             return self._reply_json(
                 {"error": str(e),
-                 "hint": "Attendance is read from Infino; SQLite is only the "
-                         "delivery buffer. Check /status for the outbox.",
-                 "pending_delivery": self.store.pending_delivery()},
+                 "hint": "Attendance lives only in Infino. If this "
+                         "persists, punches are being refused at the door and "
+                         "the terminal is holding them."},
                 e.status)
 
         has_more = len(rows) > limit
@@ -2245,8 +1816,6 @@ class Handler(BaseHTTPRequestHandler):
             "limit": limit,
             "offset": offset,
             "has_more": has_more,
-            # Not yet in Infino, therefore not in the numbers above.
-            "pending_delivery": self.store.pending_delivery(),
             "redacted": self.cfg.redact_pins,
             "attendance": [self._attendance_json(r) for r in rows[:limit]],
         })
@@ -2320,43 +1889,62 @@ class Handler(BaseHTTPRequestHandler):
     # ---- user roster ---------------------------------------------------
     def _harvest_users(self, serial, body):
         """
-        Pick USER records out of a device upload.
+        Pick USER records out of a device upload and publish them.
 
         Which endpoint and table the dump arrives on varies by firmware — a
         `table=USERINFO` POST, an OPERLOG push, or the body of a devicecmd
         reply to DATA QUERY USERINFO. Rather than guess, every non-ATTLOG body
         is scanned; a body with no USER lines costs one failed regex per line.
+
+        A failure here is logged, never fatal: the upload still has to be
+        acknowledged or the terminal re-sends it forever, and the roster is a
+        convenience next to attendance.
         """
-        found = 0
+        rows = []
         for line in body.splitlines():
             fields = parse_user_line(line)
-            if fields is None:
-                continue
-            try:
-                self.store.record_device_user(serial, fields, line)
-                found += 1
-            except Exception:
-                # An upload must still be acknowledged or the device re-sends
-                # it forever; the roster is not worth stalling the device over.
-                LOG.exception("failed to store USER record from SN=%s", serial)
-        if found:
-            LOG.info("  harvested %d user record(s) from SN=%s", found, serial)
-        return found
+            if fields is not None:
+                rows.append(device_user_payload(serial, fields))
+        if not rows:
+            return 0
+        try:
+            self.publisher.publish_users(rows)
+        except InfinoError as e:
+            LOG.error("could not publish %d user record(s) from SN=%s: %s "
+                      "(re-run /users/sync)", len(rows), serial, e)
+            return 0
+        LOG.info("  published %d user record(s) from SN=%s", len(rows), serial)
+        return len(rows)
+
+    @staticmethod
+    def _missing_table_hint(err):
+        """Turn the query planner's 'table not found' into something actionable."""
+        if "not found" in str(err).lower():
+            return ("The table does not exist yet. It is created at startup "
+                    "when Infino is configured; for the roster, run "
+                    "/users/sync and let the device answer.")
+        return None
 
     def _person_json(self, row):
-        """One roster row as /users returns it."""
+        """
+        One roster row as /users returns it. Infino omits NULL columns from a
+        row object rather than returning null, so every field goes through
+        .get().
+        """
         redact = self.cfg.redact_pins
+        privilege = row.get("privilege")
         return {
-            "serial": row["serial"],
-            "user_id": self._user_id_for_log(row["user_id"]),
-            "name": "<redacted>" if redact else row["name"],
-            "privilege": PRIVILEGE.get(row["privilege"],
-                                       f"unknown_{row['privilege']}"),
-            "card": "<redacted>" if redact else row["card"],
-            "group": row["group_id"],
-            "timezones": row["timezones"],
-            "has_password": bool(row["has_password"]),
-            "last_seen_utc": row["last_seen_utc"],
+            "serial": row.get("device_serial"),
+            "user_id": self._user_id_for_log(str(row.get("employee_user_id",
+                                                         ""))),
+            "name": "<redacted>" if redact else row.get("person_name"),
+            "privilege": row.get("privilege_label")
+                         or PRIVILEGE.get(privilege, f"unknown_{privilege}"),
+            "card": "<redacted>" if redact else row.get("card"),
+            "group": row.get("group_id"),
+            "timezones": row.get("timezones"),
+            "has_password": bool(row.get("has_password")),
+            "synced_at": row.get("synced_at"),
         }
 
     @staticmethod
@@ -2409,17 +1997,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/healthz":
             silent = self.registry.silent_for()
             worst = max(silent.values()) if silent else None
-            stats = self.store.stats()
-            degraded = (worst is None or worst > self.cfg.silence_secs
-                        or stats["outbox_dead"] > 0)
+            degraded = worst is None or worst > self.cfg.silence_secs
             return self._reply_json(
                 {"status": "degraded" if degraded else "ok",
                  "uptime_secs": round(time.monotonic() - self.started_at),
                  "devices_registered": len(silent),
                  "seconds_since_last_contact":
                      None if worst is None else round(worst),
-                 "outbox_pending": stats["outbox_pending"],
-                 "outbox_dead": stats["outbox_dead"]},
+                 # A punch that could not be published was refused at the
+                 # door, so the terminal still holds it. This is the count of
+                 # rows Infino rejected outright, which are gone.
+                 "rows_dropped_this_run": self.publisher.dropped},
                 200 if not degraded else 503)
 
         if not self._authorized(q):
@@ -2436,38 +2024,46 @@ class Handler(BaseHTTPRequestHandler):
                                "attendance_table": self.cfg.infino_table,
                                "arrivals_table":
                                    self.cfg.infino_arrivals_table,
-                           } if any(s.startswith("infino")
-                                    for s in self.cfg.sinks) else None,
+                               "users_table": self.cfg.infino_users_table,
+                           } if self.infino.configured else None,
                            "debug_endpoints": self.cfg.debug_endpoints},
                 "devices": [
-                    {"serial": r["serial"],
-                     "last_seen_utc": r["last_seen_utc"],
-                     "last_event": r["last_event"],
-                     "contacts": r["contacts"],
-                     "seconds_since_contact":
-                         round(silent[r["serial"]])
-                         if r["serial"] in silent else None}
-                    for r in self.store.devices()],
+                    {"serial": serial,
+                     "seconds_since_contact": round(gap)}
+                    for serial, gap in sorted(silent.items())],
                 "queued_commands": self.queue.snapshot(),
-                "delivery": {"delivered_this_run": self.worker.delivered,
-                             "failures_this_run": self.worker.failed,
-                             "last_success_utc": self.worker.last_success_utc},
-                "store": self.store.stats(),
+                "published_this_run": self.publisher.appended,
+                "dropped_this_run": self.publisher.dropped,
             })
 
         if path == "/punches":
+            limit = self._int_param(q, "limit", 20, 1, 500)
+            if limit is None:
+                return
             try:
-                limit = int(q.get("limit", ["20"])[0])
-            except ValueError:
-                return self._reply("limit must be an integer\n", 400)
+                # DISTINCT on event_id: Infino has no append idempotency, so a
+                # retried batch can land the same punch twice (M3.6).
+                rows = self.infino.rows(f"""
+                    SELECT DISTINCT event_id, employee_user_id, device_serial,
+                           punched_at_local, punched_at, direction,
+                           verify_method
+                      FROM {self.cfg.infino_table}
+                     ORDER BY punched_at_local DESC
+                     LIMIT {limit}
+                """)
+            except InfinoError as e:
+                LOG.warning("punches query failed: %s", e)
+                return self._reply_json({"error": str(e)}, e.status)
             return self._reply_json([
-                {"user_id": self._user_id_for_log(r["user_id"]),
-                 "punched_local": r["punched_local"],
-                 "punched_utc": r["punched_utc"],
-                 "direction": PUNCH_STATUS.get(r["status"], r["status"]),
-                 "verify": VERIFY_METHOD.get(r["verify"], r["verify"]),
-                 "serial": r["serial"]}
-                for r in self.store.recent_punches(limit)])
+                {"event_id": r.get("event_id"),
+                 "user_id": self._user_id_for_log(
+                     str(r.get("employee_user_id", ""))),
+                 "punched_local": r.get("punched_at_local"),
+                 "punched_utc": r.get("punched_at"),
+                 "direction": r.get("direction"),
+                 "verify": r.get("verify_method"),
+                 "serial": r.get("device_serial")}
+                for r in rows])
 
         if path == "/attendance":
             return self._attendance(q)
@@ -2477,8 +2073,33 @@ class Handler(BaseHTTPRequestHandler):
         # came in, which is what you copy out.
         if path == "/users":
             serial = q.get("sn", [""])[0].strip() or None
-            people = [self._person_json(r)
-                      for r in self.store.device_users(serial)]
+            if serial and not _SAFE_FILTER_RE.fullmatch(serial):
+                return self._reply("sn must be alphanumeric\n", 400)
+            where = (f"WHERE device_serial = {_sql_text(serial)}"
+                     if serial else "")
+            try:
+                # The roster table is append-only, so a re-sync adds rows
+                # rather than replacing them: newest synced_at per person wins.
+                rows = self.infino.rows(f"""
+                    WITH latest AS (
+                      SELECT device_serial, employee_user_id,
+                             MAX(synced_at) AS synced_at
+                        FROM {self.cfg.infino_users_table}
+                        {where}
+                       GROUP BY device_serial, employee_user_id
+                    )
+                    SELECT u.* FROM {self.cfg.infino_users_table} u
+                      JOIN latest l
+                        ON u.device_serial = l.device_serial
+                       AND u.employee_user_id = l.employee_user_id
+                       AND u.synced_at = l.synced_at
+                     ORDER BY CAST(u.employee_user_id AS INT),
+                              u.employee_user_id
+                """)
+            except InfinoError as e:
+                LOG.warning("roster query failed: %s", e)
+                return self._reply_json({"error": str(e), "hint": self._missing_table_hint(e)}, e.status)
+            people = [self._person_json(r) for r in rows]
             self._log_roster(people)
             return self._reply_json({
                 "device_serial": serial,
@@ -2586,7 +2207,6 @@ class Handler(BaseHTTPRequestHandler):
                 LOG.info("  table=%s body=%s", table or "?",
                          safe.strip()[:400])
                 self._harvest_users(serial, body)
-                self.store.record_upload(serial, table, safe)
             return self._reply("OK")
 
         if path.startswith("/iclock/devicecmd"):
@@ -2595,7 +2215,6 @@ class Handler(BaseHTTPRequestHandler):
                 safe = scrub_secrets(body)
                 LOG.info("  ack: %s", safe.strip()[:300])
                 self._harvest_users(serial, body)
-                self.store.record_upload(serial, "devicecmd", safe)
             return self._reply("OK")
 
         self._note(serial, f"OTHER POST {path}")
@@ -2603,7 +2222,6 @@ class Handler(BaseHTTPRequestHandler):
             safe = scrub_secrets(body)
             LOG.info("  body: %s", safe.strip()[:300])
             self._harvest_users(serial, body)
-            self.store.record_upload(serial, table or path, safe)
         return self._reply("OK")
 
 
@@ -2631,16 +2249,16 @@ def _banner(cfg, directory):
     LOG.info(" listening      http://%s:%s   (bind %s)", ip, cfg.port,
              cfg.bind)
     LOG.info(" device config  Address=%s  Port=%s  Mode=ADMS", ip, cfg.port)
-    LOG.info(" database       %s", os.path.abspath(cfg.db_path))
+    LOG.info(" storage        Infino only — nothing at rest on this machine")
     LOG.info(" directory      %s", f"{cfg.directory_file} ({len(directory)} "
              f"person/people)" if cfg.directory_file else "not set")
     LOG.info(" device tz      %s", cfg.device_tz)
     LOG.info(" sinks          %s", ", ".join(cfg.sinks))
-    for sink, table in (("infino", cfg.infino_table),
-                        ("infino_arrivals", cfg.infino_arrivals_table)):
-        if sink in cfg.sinks:
-            LOG.info(" %-14s %s/v1/append/%s?table=%s", sink,
-                     cfg.infino_url, cfg.infino_database, table)
+    if any(s.startswith("infino") for s in cfg.sinks):
+        LOG.info(" infino         %s/%s", cfg.infino_url, cfg.infino_database)
+        LOG.info(" tables         %s (punches), %s (arrivals), %s (roster)",
+                 cfg.infino_table, cfg.infino_arrivals_table,
+                 cfg.infino_users_table)
     if cfg.allowed_serials:
         LOG.info(" serials        %s", ", ".join(sorted(cfg.allowed_serials)))
     if cfg.debug_endpoints:
@@ -2707,25 +2325,30 @@ def main(argv=None):
         LOG.info("configuration OK")
         return 0
 
-    store = Store(cfg.db_path)
-    sinks = build_sinks(cfg)
-    stop = threading.Event()
-    # Surface a bad key or unreachable cloud at startup rather than on the
-    # first punch. Deliberately non-fatal: collecting attendance matters more
-    # than forwarding it, and the outbox holds anything we can't send yet.
-    for sink in sinks.values():
-        if hasattr(sink, "ensure_ready"):
-            sink.ensure_ready()
-    worker = DeliveryWorker(cfg, store, sinks, stop)
+    client = InfinoClient(cfg)
+    publisher = Publisher(cfg, client)
+    tables = {cfg.infino_table: INFINO_TABLE_SCHEMA,
+              cfg.infino_arrivals_table: INFINO_ARRIVALS_SCHEMA,
+              cfg.infino_users_table: INFINO_USERS_SCHEMA}
+    # Not gated on the sinks: /attendance and /users read these tables even in
+    # a log-only dry run, and a missing table is a confusing 400 from the
+    # query planner. Surfaces a bad key at startup rather than at 9am.
+    # Non-fatal — tables are re-created on demand, and until then the device
+    # is told to hold its records.
+    if client.configured:
+        try:
+            client.ensure_ready(tables)
+        except InfinoError as e:
+            LOG.error("Infino is not ready: %s — punches will be refused "
+                      "until it is reachable", e)
 
     Handler.cfg = cfg
-    Handler.store = store
     Handler.queue = CommandQueue()
     Handler.registry = DeviceRegistry()
-    Handler.worker = worker
     Handler.directory = directory
-    Handler.arrivals = ArrivalDebounce()
-    Handler.query = InfinoQuery(cfg)
+    Handler.infino = client
+    Handler.publisher = publisher
+    Handler.greetings = GreetingGuard(client, cfg.infino_arrivals_table)
     Handler.started_at = time.monotonic()
 
     try:
@@ -2737,22 +2360,18 @@ def main(argv=None):
 
     def _shutdown(signum, _frame):
         LOG.info("signal %s received, shutting down", signal.Signals(signum).name)
-        stop.set()
         threading.Thread(target=httpd.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
-    worker.start()
     _banner(cfg, directory)
     try:
         httpd.serve_forever(poll_interval=0.5)
     finally:
-        stop.set()
         httpd.server_close()
-        worker.join(timeout=10)
-        LOG.info("stopped. %d delivered, %d failures this run.",
-                 worker.delivered, worker.failed)
+        LOG.info("stopped. %d row(s) published, %d dropped this run.",
+                 publisher.appended, publisher.dropped)
     return 0
 
 
