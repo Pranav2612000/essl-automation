@@ -396,6 +396,14 @@ class Config:
         elif len(self.auth_token) < 16:
             raise ConfigError("ZK_AUTH_TOKEN is shorter than 16 characters; "
                               "generate one with secrets.token_urlsafe(24)")
+        # The arrivals table is the greeting ledger. Without the sink that
+        # writes it, "once a day" holds only for as long as this process
+        # lives — fine for a dry run, but say so rather than let someone
+        # discover it after a restart.
+        if "infino_arrivals" not in self.sinks:
+            LOG.warning("ZK_SINKS has no 'infino_arrivals', so arrivals are "
+                        "never written to the ledger: greetings are deduped "
+                        "in memory only and a restart will greet again.")
         if os.environ.get("ZK_DB_PATH", "").strip():
             LOG.warning("ZK_DB_PATH is set but ignored — there is no local "
                         "database any more; attendance lives only in Infino.")
