@@ -26,6 +26,11 @@
     "name is required. slack and github may be omitted or left empty for",
     "someone who has no account; they print as '-'.",
     "",
+    "The account keys also accept _id, _user_id, _login, _username and _handle",
+    "suffixes (slack_id, github_id, ...), case-insensitively. A key that looks",
+    "like one of these but isn't readable warns at startup rather than quietly",
+    "printing '-'.",
+    "",
     "Keys starting with _ are skipped by the loader, so this block is safe to",
     "keep as a note to whoever edits the file next."
   ],

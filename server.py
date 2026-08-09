@@ -648,10 +648,14 @@ def scrub_secrets(text):
 # Identity directory
 # --------------------------------------------------------------------------
 
-# Field aliases accepted in the directory file. The canonical names are the
-# short ones; the rest are what people actually type.
-_SLACK_KEYS = ("slack", "slack_id", "slack_user_id", "slack_handle")
-_GITHUB_KEYS = ("github", "github_login", "github_username", "github_handle")
+# Field aliases accepted in the directory file. `slack` and `github` are the
+# canonical names; the rest are what people actually type. Both lists are
+# generated from one set of suffixes rather than written out, because two
+# hand-maintained lists drift — `github_id` was once missing while `slack_id`
+# was present, so a file using both got a GitHub handle silently dropped.
+_ACCOUNT_SUFFIXES = ("", "_id", "_user_id", "_login", "_username", "_handle")
+_SLACK_KEYS = tuple("slack" + suffix for suffix in _ACCOUNT_SUFFIXES)
+_GITHUB_KEYS = tuple("github" + suffix for suffix in _ACCOUNT_SUFFIXES)
 
 
 @dataclass(frozen=True)
@@ -663,11 +667,28 @@ class Person:
 
 
 def _first_value(body, keys):
+    """First non-empty value among `keys`, matched case-insensitively."""
+    lowered = {str(k).lower(): v for k, v in body.items()}
     for key in keys:
-        value = body.get(key)
+        value = lowered.get(key)
         if isinstance(value, (str, int)) and str(value).strip():
             return str(value).strip()
     return ""
+
+
+def _stray_key(body, prefix, keys):
+    """
+    A key that was plainly meant to be `prefix` but isn't one we read.
+
+    Only consulted when the field came out empty, which makes it precise: it
+    answers "you wrote something github-shaped and got nothing, here is why"
+    rather than complaining about extra fields someone keeps for their own use.
+    """
+    for key in body:
+        low = str(key).lower()
+        if low.startswith(prefix) and low not in keys:
+            return str(key)
+    return None
 
 
 class Directory:
@@ -762,9 +783,21 @@ class Directory:
                 raise ConfigError(f"{self.path}: user ID {user_id} has no "
                                   f"name. Copy it from /users so the greeting "
                                   f"can address someone.")
+            slack = _first_value(body, _SLACK_KEYS)
+            github = _first_value(body, _GITHUB_KEYS)
+            # An unreadable account field is otherwise silent — it just prints
+            # as "-", which looks like "this person has no GitHub" rather than
+            # "you spelled the key differently than I read it".
+            for label, value, keys in (("slack", slack, _SLACK_KEYS),
+                                       ("github", github, _GITHUB_KEYS)):
+                stray = _stray_key(body, label, keys) if not value else None
+                if stray:
+                    LOG.warning(
+                        "%s: user ID %s has %r, which is not a field this "
+                        "reads, so %s will print as '-'. Accepted: %s",
+                        self.path, user_id, stray, label, ", ".join(keys[:3]))
             people[user_id] = Person(user_id=user_id, name=name,
-                                     slack=_first_value(body, _SLACK_KEYS),
-                                     github=_first_value(body, _GITHUB_KEYS))
+                                     slack=slack, github=github)
         self._people = people
         return self
 
