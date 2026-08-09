@@ -146,8 +146,20 @@ built and tested; `[ ]` is not started.
   `Retry-After` honoured, 404 triggers re-bootstrap, and a rejected batch is
   re-sent row by row so one bad record is dead-lettered instead of blocking the
   queue. `Punch.payload()` now matches `INFINO_TABLE_SCHEMA` column for column.
+- [x] **M3.8** **Arrivals sink.** A second Infino table, `arrivals`, one row per
+  announced arrival with `person_name` / `slack_id` / `github_id` denormalised
+  onto it and `event_id` joining back to `attendance`. Identity is copied, not
+  referenced: Infino is append-only, so a `people` dimension table could never
+  be updated in place and every read would need a latest-row-wins subquery,
+  while a copied row correctly records who someone was at the time. Unmapped
+  users still get a row (`identity_source='unmapped'`). Same `InfinoSink` class
+  parameterised by table and schema, so retry, batching, bootstrap and
+  dead-lettering are shared. `log_arrivals` is the dry-run twin. Verified
+  against a stub that rejects unknown columns: two tables created, batches
+  never mixed across sinks, and a cloud outage left arrivals pending and
+  delivered them on recovery.
 - [ ] **M3.3** Run it against the real tenant with a live key and confirm the
-  rows are queryable via `/v1/query_sql`.
+  rows are queryable via `/v1/query_sql`. **Both** tables now.
 - [ ] **M3.6** **New, from M3.1.** Close the duplicate window: Infino has no
   idempotency key, so a response lost after a committed append means the retry
   writes the row twice. Before retrying a row whose previous failure was

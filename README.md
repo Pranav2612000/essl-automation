@@ -48,9 +48,30 @@ Point the device at it exactly as described below, then watch punches land:
 ```
 
 To forward punches to [Infino Cloud](https://infino.ai/docs), set
-`ZK_SINKS=infino` with `ZK_INFINO_DATABASE` and `ZK_INFINO_API_KEY`. Punches are
-appended as rows to an `attendance` table, which the server creates on startup
-if it doesn't exist.
+`ZK_SINKS=infino,infino_arrivals` with `ZK_INFINO_DATABASE` and
+`ZK_INFINO_API_KEY`. One database holds two tables, both created on startup if
+they don't exist:
+
+| Table | Grain | Holds |
+| --- | --- | --- |
+| `attendance` | one row per punch | device truth: user ID, time, direction, verify method |
+| `arrivals` | one row per arrival | the same event plus `person_name`, `slack_id`, `github_id` from the directory |
+
+`event_id` is the same in both, so they join. Identity is copied onto the
+arrival row rather than referenced: Infino is append-only, so there is no
+`UPDATE` to repair a stale join, and a row recording who someone was when they
+arrived stays true after they change their Slack handle. Someone with no
+directory entry still gets a row, with nulls and `identity_source='unmapped'` —
+"arrivals we cannot name" is worth being able to query.
+
+```sql
+SELECT person_name, slack_id, github_id, arrived_at_local
+  FROM arrivals
+ WHERE local_date = '2026-08-09' AND identity_source = 'directory'
+```
+
+`log` and `log_arrivals` are the dry-run equivalents: same outbox, same rows,
+printed instead of sent.
 
 Each punch is committed to SQLite before the device is acknowledged and queued
 in an outbox that a background worker drains in batches with exponential

@@ -111,7 +111,16 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 USER_AGENT = "essl-automation-server/1.0"
 PAYLOAD_SCHEMA = "essl.attendance.v1"
+ARRIVAL_SCHEMA = "essl.arrival.v1"
 LOG = logging.getLogger("essl")
+
+# Sinks are split by what they carry, not by where they send it. An attendance
+# sink takes one row per punch — device truth. An arrival sink takes one row
+# per announced arrival, with identity attached. A punch produces an outbox row
+# for every configured sink of the kind it qualifies for.
+ATTENDANCE_SINKS = frozenset({"log", "infino"})
+ARRIVAL_SINKS = frozenset({"log_arrivals", "infino_arrivals"})
+KNOWN_SINKS = ATTENDANCE_SINKS | ARRIVAL_SINKS
 
 # ATTLOG status codes (byte 3 of each record).
 PUNCH_STATUS = {
@@ -284,6 +293,7 @@ class Config:
     infino_url: str
     infino_database: str
     infino_table: str
+    infino_arrivals_table: str
     infino_api_key: str
     infino_timeout: float
     infino_bootstrap: bool
@@ -336,6 +346,8 @@ class Config:
             infino_url=infino_url,
             infino_database=database,
             infino_table=os.environ.get("ZK_INFINO_TABLE", "attendance"),
+            infino_arrivals_table=os.environ.get("ZK_INFINO_ARRIVALS_TABLE",
+                                                 "arrivals"),
             # INFINO_API_KEY is the name Infino's own SDKs read, so accept it.
             infino_api_key=(os.environ.get("ZK_INFINO_API_KEY", "")
                             or os.environ.get("INFINO_API_KEY", "")),
@@ -383,14 +395,19 @@ class Config:
             LOG.warning("ZK_DIRECTORY_FILE is not set — an arrival will be "
                         "logged by user ID only, with no name, Slack or GitHub. "
                         "Copy directory.example.json and point at it.")
-        unknown = set(self.sinks) - {"log", "infino"}
+        unknown = set(self.sinks) - KNOWN_SINKS
         if unknown:
             raise ConfigError(f"ZK_SINKS contains unknown sink(s): "
-                              f"{', '.join(sorted(unknown))}")
+                              f"{', '.join(sorted(unknown))}. Known: "
+                              f"{', '.join(sorted(KNOWN_SINKS))}")
         if not self.sinks:
             raise ConfigError("ZK_SINKS is empty; use 'log' to store punches "
                               "without forwarding them")
-        if "infino" in self.sinks:
+        # Both Infino sinks share one account, database and key — they differ
+        # only in which table they append to.
+        cloud = sorted(s for s in self.sinks if s.startswith("infino"))
+        if cloud:
+            named = " and ".join(f"'{s}'" for s in cloud)
             parsed = urlparse(self.infino_url)
             if parsed.scheme not in ("http", "https"):
                 raise ConfigError(f"ZK_INFINO_URL must be http(s), got "
@@ -405,14 +422,19 @@ class Config:
                     "personal data — use HTTPS.")
             if not self.infino_database:
                 raise ConfigError(
-                    "ZK_SINKS includes 'infino' but no database is set. Use "
+                    f"ZK_SINKS includes {named} but no database is set. Use "
                     "ZK_INFINO_DATABASE=my-app, or put it in the URL as "
                     "ZK_INFINO_URL=https://api.platform.infino.ws/my-app")
             if not self.infino_api_key:
                 raise ConfigError(
-                    "ZK_SINKS includes 'infino' but no API key is set. Create "
+                    f"ZK_SINKS includes {named} but no API key is set. Create "
                     "one at https://platform.infino.ws and set "
                     "ZK_INFINO_API_KEY (or INFINO_API_KEY).")
+            if self.infino_table == self.infino_arrivals_table:
+                raise ConfigError(
+                    "ZK_INFINO_TABLE and ZK_INFINO_ARRIVALS_TABLE are both "
+                    f"{self.infino_table!r}. They hold different columns, so "
+                    "appending both to one table would be rejected.")
             if not self.infino_api_key.startswith("inf_"):
                 LOG.warning("the Infino API key does not start with 'inf_' — "
                             "check you copied a key and not something else")
@@ -523,6 +545,42 @@ class Punch:
             "received_at": self.received_utc,
             "source": USER_AGENT,
         }
+
+
+def arrival_payload(punch, person, tz_name):
+    """
+    One row, matching INFINO_ARRIVALS_SCHEMA exactly.
+
+    Identity is copied onto the row rather than referenced. Infino is
+    append-only — there is no UPDATE to repair a stale join — and a row that
+    records who someone was when they arrived stays true after they change
+    their Slack handle. `event_id` is the punch's dedup key, so this joins to
+    the attendance row it came from.
+
+    `person` is None when the user ID is not in the directory. The arrival
+    still gets a row: someone did walk in, and "arrivals we cannot name" is a
+    more useful thing to be able to query than silence.
+    """
+    return {
+        "schema_version": ARRIVAL_SCHEMA,
+        "event_id": punch.dedup_key,
+        "device_serial": punch.serial,
+        "employee_user_id": punch.user_id,
+        "person_name": (person.name or None) if person else None,
+        "slack_id": (person.slack or None) if person else None,
+        "github_id": (person.github or None) if person else None,
+        "identity_source": "directory" if person else "unmapped",
+        "arrived_at": punch.punched_utc or None,
+        "arrived_at_local": punch.punched_local,
+        "local_date": punch.local_date,
+        "timezone": tz_name,
+        "direction": punch.direction,
+        "status_code": punch.status,
+        "verify_method": VERIFY_METHOD.get(punch.verify,
+                                           f"unknown_{punch.verify}"),
+        "received_at": punch.received_utc,
+        "source": USER_AGENT,
+    }
 
 
 def parse_attlog_line(line, serial, tz, received_utc):
@@ -666,14 +724,33 @@ class Person:
     github: str
 
 
+def _text(value):
+    """
+    A JSON value as a trimmed string, or "" if there isn't one.
+
+    JSON null must not become the string "None" — that reads as a real name
+    and defeats every "is this set?" check downstream. Booleans are excluded
+    for the same reason.
+    """
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return ""
+    return str(value).strip()
+
+
 def _first_value(body, keys):
     """First non-empty value among `keys`, matched case-insensitively."""
     lowered = {str(k).lower(): v for k, v in body.items()}
     for key in keys:
-        value = lowered.get(key)
-        if isinstance(value, (str, int)) and str(value).strip():
-            return str(value).strip()
+        text = _text(lowered.get(key))
+        if text:
+            return text
     return ""
+
+
+# A Slack member ID: U or W, then uppercase alphanumerics. Worth screening for
+# because a display name in this field looks perfectly fine in a log line and
+# only fails much later, when chat.postMessage cannot resolve it.
+_SLACK_ID_RE = re.compile(r"^[UW][A-Z0-9]{6,}$")
 
 
 def _stray_key(body, prefix, keys):
@@ -755,6 +832,7 @@ class Directory:
                 f"list of entries, but the file holds a {type(raw).__name__}")
 
         people = {}
+        nameless, odd_slack = [], []
         for i, (user_id, body) in enumerate(entries, 1):
             where = (f"{self.path}: user ID {user_id}" if user_id
                      else f"{self.path}: entry {i}")
@@ -770,7 +848,7 @@ class Directory:
                     f'{where}: use "user_id", not "pin". The device sends it '
                     f'as PIN on the wire, but it is the User ID shown when '
                     f'enrolling — this file uses that name throughout.')
-            user_id = (user_id or str(body.get("user_id", ""))).strip()
+            user_id = (user_id or _text(body.get("user_id"))).strip()
             if not user_id:
                 raise ConfigError(f"{where}: no user ID. Either key each entry "
                                   f'by the device user ID, or give it a '
@@ -778,11 +856,13 @@ class Directory:
             if user_id in people:
                 raise ConfigError(
                     f"{self.path}: user ID {user_id} appears twice")
-            name = str(body.get("name", "")).strip()
+            name = _text(body.get("name"))
             if not name:
-                raise ConfigError(f"{self.path}: user ID {user_id} has no "
-                                  f"name. Copy it from /users so the greeting "
-                                  f"can address someone.")
+                # Not fatal. The terminal itself has no name for some users
+                # (admin and test accounts), so a directory built from /users
+                # inherits the gap — and losing attendance over a missing
+                # greeting name would be the wrong trade (ROADMAP M4.3).
+                nameless.append(user_id)
             slack = _first_value(body, _SLACK_KEYS)
             github = _first_value(body, _GITHUB_KEYS)
             # An unreadable account field is otherwise silent — it just prints
@@ -796,8 +876,28 @@ class Directory:
                         "%s: user ID %s has %r, which is not a field this "
                         "reads, so %s will print as '-'. Accepted: %s",
                         self.path, user_id, stray, label, ", ".join(keys[:3]))
+            if slack and not _SLACK_ID_RE.match(slack):
+                odd_slack.append(user_id)
             people[user_id] = Person(user_id=user_id, name=name,
                                      slack=slack, github=github)
+
+        # Reported together, after the whole file is read: fixing a directory
+        # one restart per problem is miserable when several entries need it.
+        if nameless:
+            LOG.warning("%s: %d entr%s have no name (user ID%s %s). They will "
+                        "be announced by user ID — the terminal has no name "
+                        "for them either, so these have to be filled in by "
+                        "hand.", self.path, len(nameless),
+                        "y" if len(nameless) == 1 else "ies",
+                        "" if len(nameless) == 1 else "s", ", ".join(nameless))
+        if odd_slack:
+            one = len(odd_slack) == 1
+            LOG.warning("%s: user ID%s %s %s a slack value that is not a "
+                        "member ID (U… or W…). A display name reads fine here "
+                        "but cannot be messaged — copy the ID from Slack "
+                        "under Profile -> More -> Copy member ID.",
+                        self.path, "" if one else "s", ", ".join(odd_slack),
+                        "has" if one else "have")
         self._people = people
         return self
 
@@ -845,6 +945,17 @@ class ArrivalDebounce:
                 return False
             self._last[key] = when
             return True
+
+    def forget(self, serial, user_id):
+        """
+        Undo the last `should_announce` for this person.
+
+        Called when storing the punch failed: the device will re-send it, and
+        without this the retry would land inside the window and be discarded,
+        turning a transient write error into a permanently missing arrival.
+        """
+        with self._lock:
+            self._last.pop((serial, user_id), None)
 
 
 # --------------------------------------------------------------------------
@@ -999,15 +1110,23 @@ class Store:
                        contacts      = contacts + 1""",
                 (serial, now, now, event))
 
-    def record_punch(self, punch, sinks, tz_name):
+    def record_punch(self, punch, sinks, tz_name, arrival=None):
         """
         Store a punch and queue it for every sink, atomically.
 
         Returns True if this punch was new, False if it was a re-upload we have
         already accepted. Either way the device gets an OK — the whole point of
         the dedup key is that a retry is harmless.
+
+        `arrival` is the row built by the caller when this punch counts as
+        someone showing up, and None otherwise (a departure, or a repeat inside
+        the debounce window). It rides the same transaction as the punch, so
+        there is no window where a punch is stored but its arrival is lost.
         """
-        payload = json.dumps(punch.payload(tz_name), separators=(",", ":"))
+        attendance_row = json.dumps(punch.payload(tz_name),
+                                    separators=(",", ":"))
+        arrival_row = (json.dumps(arrival, separators=(",", ":"))
+                       if arrival else None)
         now = _iso(_utcnow())
         with self.conn as conn:
             cur = conn.execute(
@@ -1024,12 +1143,15 @@ class Store:
                 return False
             punch_id = cur.lastrowid
             for sink in sinks:
+                row = arrival_row if sink in ARRIVAL_SINKS else attendance_row
+                if row is None:
+                    continue          # an arrival sink, and this is not one
                 conn.execute(
                     """INSERT OR IGNORE INTO outbox
                            (punch_id, sink, dedup_key, payload, state,
                             next_attempt_utc, created_utc)
                        VALUES (?,?,?,?, 'pending', ?, ?)""",
-                    (punch_id, sink, punch.dedup_key, payload, now, now))
+                    (punch_id, sink, punch.dedup_key, row, now, now))
         return True
 
     def record_device_user(self, serial, fields, raw):
@@ -1190,15 +1312,47 @@ INFINO_TABLE_SCHEMA = [
     {"name": "source", "type": "large_utf8"},
 ]
 
+# One row per announced arrival, with identity denormalised onto it. Kept
+# beside arrival_payload(), which must produce exactly these column names.
+#
+# `person_name` rather than `name` because the schema descriptors themselves
+# use a "name" key — a column called "name" reads as a mistake here.
+# Everything except event_id is nullable: an unmapped user arrives with no
+# name at all, and a person may genuinely have no GitHub account.
+INFINO_ARRIVALS_SCHEMA = [
+    {"name": "event_id", "type": "large_utf8", "nullable": False},
+    {"name": "schema_version", "type": "large_utf8"},
+    {"name": "device_serial", "type": "large_utf8"},
+    {"name": "employee_user_id", "type": "large_utf8"},
+    {"name": "person_name", "type": "large_utf8"},
+    {"name": "slack_id", "type": "large_utf8"},
+    {"name": "github_id", "type": "large_utf8"},
+    {"name": "identity_source", "type": "large_utf8"},
+    {"name": "arrived_at", "type": "large_utf8"},
+    {"name": "arrived_at_local", "type": "large_utf8"},
+    {"name": "local_date", "type": "large_utf8"},
+    {"name": "timezone", "type": "large_utf8"},
+    {"name": "direction", "type": "large_utf8"},
+    {"name": "status_code", "type": "i32"},
+    {"name": "verify_method", "type": "large_utf8"},
+    {"name": "received_at", "type": "large_utf8"},
+    {"name": "source", "type": "large_utf8"},
+]
+
 
 class LogSink:
-    """Writes rows to the log. The dry-run target: set ZK_SINKS=log."""
+    """
+    Writes rows to the log. The dry-run target: ZK_SINKS=log exercises the
+    whole outbox path with no cloud account, and 'log_arrivals' does the same
+    for arrival rows so their shape can be checked before a key exists.
+    """
 
-    name = "log"
+    def __init__(self, name="log"):
+        self.name = name
 
     def deliver(self, rows):
         for row in rows:
-            LOG.info("[log-sink] %s", row["payload"])
+            LOG.info("[%s] %s", self.name, row["payload"])
         return DeliveryResult(ok=True)
 
 
@@ -1221,12 +1375,12 @@ class InfinoSink:
     checking for the row before retrying an ambiguous failure — ROADMAP M3.6.
     """
 
-    name = "infino"
-
-    def __init__(self, cfg):
+    def __init__(self, cfg, name, table, table_schema):
+        self.name = name
         self.base = cfg.infino_url
         self.database = cfg.infino_database
-        self.table = cfg.infino_table
+        self.table = table
+        self.table_schema = table_schema
         self.api_key = cfg.infino_api_key
         self.timeout = cfg.infino_timeout
         self.autocreate = cfg.infino_bootstrap
@@ -1296,7 +1450,7 @@ class InfinoSink:
                 try:
                     self._post(f"/v1/create_table/{self.database}",
                                {"table_name": self.table,
-                                "schema": INFINO_TABLE_SCHEMA})
+                                "schema": self.table_schema})
                     LOG.info("created Infino table %r in %r",
                              self.table, self.database)
                 except urllib.error.HTTPError as e:
@@ -1358,9 +1512,23 @@ class InfinoSink:
 
 
 def build_sinks(cfg):
+    """
+    One sink object per configured name.
+
+    Both Infino sinks are the same class pointed at different tables, so the
+    retry, batching, bootstrap and dead-letter behaviour is shared rather than
+    reimplemented for arrivals.
+    """
+    tables = {"infino": (cfg.infino_table, INFINO_TABLE_SCHEMA),
+              "infino_arrivals": (cfg.infino_arrivals_table,
+                                  INFINO_ARRIVALS_SCHEMA)}
     sinks = {}
     for name in cfg.sinks:
-        sinks[name] = InfinoSink(cfg) if name == "infino" else LogSink()
+        if name in tables:
+            table, schema = tables[name]
+            sinks[name] = InfinoSink(cfg, name, table, schema)
+        else:
+            sinks[name] = LogSink(name)
     return sinks
 
 
@@ -1742,12 +1910,18 @@ class Handler(BaseHTTPRequestHandler):
                 LOG.warning("unparseable ATTLOG line from SN=%s: %r",
                             serial, line[:200])
                 continue
+            # Decided before the write so the arrival row lands in the same
+            # transaction as the punch it describes.
+            arrival = self._arrival_for(punch)
             try:
                 is_new = self.store.record_punch(punch, self.cfg.sinks,
-                                                 self.cfg.device_tz)
+                                                 self.cfg.device_tz, arrival)
             except Exception:
                 # Do NOT acknowledge what we failed to store — let the device
-                # keep the record and re-send it.
+                # keep the record and re-send it. Release the debounce too, or
+                # the re-send would be swallowed and the arrival lost for good.
+                if arrival:
+                    self.arrivals.forget(punch.serial, punch.user_id)
                 LOG.exception("failed to store punch from SN=%s", serial)
                 self._reply("storage error\n", 500)
                 return
@@ -1758,7 +1932,8 @@ class Handler(BaseHTTPRequestHandler):
                          self._user_id_for_log(punch.user_id), punch.punched_local,
                          punch.punched_utc or "?", punch.direction,
                          VERIFY_METHOD.get(punch.verify, punch.verify))
-                self._announce_arrival(punch)
+                if arrival:
+                    self._log_arrival(arrival)
             else:
                 LOG.debug("duplicate punch ignored: %s", punch.dedup_key[:12])
 
@@ -1770,39 +1945,54 @@ class Handler(BaseHTTPRequestHandler):
         self._reply(f"OK: {accepted + malformed}")
 
     # ---- arrivals ------------------------------------------------------
-    def _announce_arrival(self, punch):
+    def _arrival_for(self, punch):
         """
-        Say who just walked in. Called once per *new* punch, so a device
-        re-uploading a batch cannot repeat the line.
+        Decide whether this punch is someone showing up, and if so build the
+        row for it. Returns the payload, or None.
 
         Anything that is not explicitly a departure counts as an arrival. Many
         terminals never report a direction at all — they send status 255 — so
         requiring an explicit check-in would mean never announcing anyone.
 
+        One decision, two consumers: the terminal line and the outbox row are
+        built from the same payload, so they cannot disagree about who arrived.
+
         This is not yet the once-a-day greeting: a second arrival after lunch
-        announces again, subject only to the short debounce. First-punch-of-day
+        counts again, subject only to the short debounce. First-punch-of-day
         and its durable idempotency guard are ROADMAP M5.1 and M5.2.
         """
         if punch.status in DEPARTURE_STATUS:
-            LOG.debug("no arrival line for %s: direction is %s",
+            LOG.debug("no arrival for %s: direction is %s",
                       self._user_id_for_log(punch.user_id), punch.direction)
-            return
-        if self.cfg.redact_pins:
-            return
+            return None
         if not self.arrivals.should_announce(punch.serial, punch.user_id,
                                              punch.punched_utc):
-            LOG.debug("arrival for %s already announced within %ds",
+            LOG.debug("arrival for %s already recorded within %ds",
                       self._user_id_for_log(punch.user_id),
                       ARRIVAL_DEBOUNCE_SECS)
+            return None
+        return arrival_payload(punch, self.directory.get(punch.user_id),
+                               self.cfg.device_tz)
+
+    def _log_arrival(self, arrival):
+        """
+        Say who just walked in.
+
+        ZK_REDACT_PINS silences this line but does not suppress the arrival
+        row: it is a control over logs and API output, and the forwarded
+        payload has always carried real identifiers.
+        """
+        if self.cfg.redact_pins:
             return
-        person = self.directory.get(punch.user_id)
-        if person is None:
+        if arrival["identity_source"] == "unmapped":
             LOG.warning("user %s entered office, but is not in %s — add them "
-                        "to see their name, Slack and GitHub", punch.user_id,
+                        "to see their name, Slack and GitHub",
+                        arrival["employee_user_id"],
                         self.cfg.directory_file or "any directory file")
             return
-        LOG.info("%s entered office. slack: %s github: %s", person.name,
-                 person.slack or "-", person.github or "-")
+        LOG.info("%s entered office. slack: %s github: %s",
+                 arrival["person_name"] or f"user {arrival['employee_user_id']}",
+                 arrival["slack_id"] or "-", arrival["github_id"] or "-")
 
     # ---- user roster ---------------------------------------------------
     def _harvest_users(self, serial, body):
@@ -1920,8 +2110,11 @@ class Handler(BaseHTTPRequestHandler):
                            "infino": {
                                "url": self.cfg.infino_url,
                                "database": self.cfg.infino_database or None,
-                               "table": self.cfg.infino_table,
-                           } if "infino" in self.cfg.sinks else None,
+                               "attendance_table": self.cfg.infino_table,
+                               "arrivals_table":
+                                   self.cfg.infino_arrivals_table,
+                           } if any(s.startswith("infino")
+                                    for s in self.cfg.sinks) else None,
                            "debug_endpoints": self.cfg.debug_endpoints},
                 "devices": [
                     {"serial": r["serial"],
@@ -2117,9 +2310,11 @@ def _banner(cfg, directory):
              f"person/people)" if cfg.directory_file else "not set")
     LOG.info(" device tz      %s", cfg.device_tz)
     LOG.info(" sinks          %s", ", ".join(cfg.sinks))
-    if "infino" in cfg.sinks:
-        LOG.info(" infino         %s/v1/append/%s?table=%s",
-                 cfg.infino_url, cfg.infino_database, cfg.infino_table)
+    for sink, table in (("infino", cfg.infino_table),
+                        ("infino_arrivals", cfg.infino_arrivals_table)):
+        if sink in cfg.sinks:
+            LOG.info(" %-14s %s/v1/append/%s?table=%s", sink,
+                     cfg.infino_url, cfg.infino_database, table)
     if cfg.allowed_serials:
         LOG.info(" serials        %s", ", ".join(sorted(cfg.allowed_serials)))
     if cfg.debug_endpoints:
