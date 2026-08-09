@@ -149,17 +149,38 @@ built and tested; `[ ]` is not started.
 - [x] **M3.8** **Arrivals sink.** A second Infino table, `arrivals`, one row per
   announced arrival with `person_name` / `slack_id` / `github_id` denormalised
   onto it and `event_id` joining back to `attendance`. Identity is copied, not
-  referenced: Infino is append-only, so a `people` dimension table could never
-  be updated in place and every read would need a latest-row-wins subquery,
-  while a copied row correctly records who someone was at the time. Unmapped
+  referenced, because a point-in-time record — who someone was when they
+  arrived — is the correct answer for an attendance row, and a dimension table
+  would need a latest-row-wins join on every read. (Infino does expose
+  `/v1/update`, so a dimension table was possible; it was not the right shape.) Unmapped
   users still get a row (`identity_source='unmapped'`). Same `InfinoSink` class
   parameterised by table and schema, so retry, batching, bootstrap and
   dead-lettering are shared. `log_arrivals` is the dry-run twin. Verified
   against a stub that rejects unknown columns: two tables created, batches
   never mixed across sinks, and a cloud outage left arrivals pending and
   delivered them on recovery.
-- [ ] **M3.3** Run it against the real tenant with a live key and confirm the
-  rows are queryable via `/v1/query_sql`. **Both** tables now.
+- [x] **M3.3** Run against the real tenant. Both tables bootstrapped and
+  appended on the first attempt, and both are queryable. The read contract,
+  which M3.1 never captured:
+  - `POST /v1/query_sql/{database}` `{"query": "…"}` — database is a path
+    segment, and the only body field is `query`.
+  - Send `Accept: application/json` or the response is an Arrow IPC stream,
+    which would mean a pyarrow dependency to read our own attendance.
+  - The body is a plain array of row objects: `[{"col": value}, …]`.
+  - **A NULL column is omitted from the row object entirely**, not returned as
+    null — every read goes through `.get()`.
+  - SQL is read-only, Apache DataFusion, Postgres-leaning: CTEs, JOINs,
+    GROUP BY with aggregates, window functions, ORDER BY, LIMIT.
+  - **No bind parameters.** Filter values are screened against a strict
+    charset and rejected, then quoted — never escaped into the query.
+  - 400 bad body, 401 bad key, 503 with `Retry-After` while workers activate.
+- [x] **M3.9** `/attendance` reads Infino, not SQLite: one row per person per
+  day (first seen, last seen, punch count, minutes on site), identity joined
+  from the `arrivals` table so the answer does not shift when directory.json
+  is edited. Dedups on `event_id` per M3.6. Reports `pending_delivery` from
+  the local outbox so a caller can tell "nobody came in" from "nothing has
+  shipped yet", and returns 502/503 rather than silently falling back to the
+  buffer.
 - [ ] **M3.6** **New, from M3.1.** Close the duplicate window: Infino has no
   idempotency key, so a response lost after a committed append means the retry
   writes the row twice. Before retrying a row whose previous failure was

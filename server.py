@@ -66,8 +66,8 @@ Device (unauthenticated — a terminal cannot present a token):
 Operator (require $ZK_AUTH_TOKEN as ?token= or an X-Auth-Token header):
     /healthz             liveness, no token, no data
     /status              devices, outbox depth, queued commands
-    /punches?limit=20    most recent stored punches (quick look)
-    /attendance          attendance as JSON, filtered:
+    /punches?limit=20    most recent punches in the local buffer
+    /attendance          attendance from Infino: one row per person per day
                          ?date= | ?from=&to=  ?user_id=  ?sn=
                          ?limit=&offset=  ?order=asc|desc
     /users/sync          ask the device to upload its user table (one-off)
@@ -550,15 +550,46 @@ class Punch:
         }
 
 
+# Filter values that reach a SQL string. Infino's query API takes SQL text
+# with no bind parameters, so anything user-supplied is screened against this
+# first and quoted second — the value is rejected outright rather than escaped
+# into something clever.
+_SAFE_FILTER_RE = re.compile(r"[A-Za-z0-9_\-]{1,64}")
+
+
+def _sql_text(value):
+    """A single-quoted SQL literal, with embedded quotes doubled."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _minutes_between(first_local, last_local):
+    """
+    Whole minutes between two "YYYY-MM-DD HH:MM:SS" device-local stamps.
+
+    Done here rather than in SQL: DataFusion would need a cast to timestamp
+    and an interval, and the arithmetic is not worth a dialect dependency.
+    Returns None if either end is missing or unparseable.
+    """
+    fmt = "%Y-%m-%d %H:%M:%S"
+    try:
+        start = datetime.datetime.strptime(first_local, fmt)
+        end = datetime.datetime.strptime(last_local, fmt)
+    except (TypeError, ValueError):
+        return None
+    return max(0, int((end - start).total_seconds() // 60))
+
+
 def arrival_payload(punch, person, tz_name):
     """
     One row, matching INFINO_ARRIVALS_SCHEMA exactly.
 
-    Identity is copied onto the row rather than referenced. Infino is
-    append-only — there is no UPDATE to repair a stale join — and a row that
-    records who someone was when they arrived stays true after they change
-    their Slack handle. `event_id` is the punch's dedup key, so this joins to
-    the attendance row it came from.
+    Identity is copied onto the row rather than referenced, so it records who
+    someone was when they arrived and stays true after they change their Slack
+    handle. (Infino does have `/v1/update`, so a dimension table *could* be
+    maintained — the reason to denormalise is that a point-in-time record is
+    the more correct answer here, not that updating is impossible.)
+    `event_id` is the punch's dedup key, so this joins to the attendance row
+    it came from.
 
     `person` is None when the user ID is not in the directory. The arrival
     still gets a row: someone did walk in, and "arrivals we cannot name" is a
@@ -1266,50 +1297,17 @@ class Store:
                  FROM punches ORDER BY id DESC LIMIT ?""",
             (max(1, min(500, limit)),)).fetchall()
 
-    def attendance(self, user_id=None, serial=None, date_from=None,
-                   date_to=None, limit=100, offset=0, newest_first=True):
+    def pending_delivery(self):
         """
-        Filtered attendance, plus the total the filter matches.
+        How many rows are still queued for the cloud.
 
-        Reads SQLite rather than Infino: this is the source of truth that
-        feeds the cloud, it is complete even while the outbox is draining, and
-        it needs no network. Returns (rows, total, has_more).
-
-        Every filter is a bound parameter — the only thing interpolated into
-        the SQL is the sort direction, which is picked from two literals.
-
-        Rows with an unparseable device timestamp have a NULL `local_date` and
-        so fall outside any date filter. They are still returned unfiltered,
-        which is where you would go looking for them.
+        Attendance is read from Infino, so anything still sitting here is a
+        gap in what a reader will see. Reporting it beats letting a caller
+        conclude that a person simply did not turn up.
         """
-        where, params = [], []
-        if user_id:
-            where.append("user_id = ?")
-            params.append(user_id)
-        if serial:
-            where.append("serial = ?")
-            params.append(serial)
-        if date_from:
-            where.append("local_date >= ?")
-            params.append(date_from)
-        if date_to:
-            where.append("local_date <= ?")
-            params.append(date_to)
-        clause = ("WHERE " + " AND ".join(where)) if where else ""
-        order = "DESC" if newest_first else "ASC"
-
-        total = self.conn.execute(
-            f"SELECT COUNT(*) AS n FROM punches {clause}",
-            params).fetchone()["n"]
-        # One more than asked for, so "is there another page?" costs nothing.
-        rows = self.conn.execute(f"""
-            SELECT dedup_key, serial, user_id, punched_local, punched_utc,
-                   local_date, status, verify, workcode, received_utc
-              FROM punches {clause}
-             ORDER BY punched_local {order}, id {order}
-             LIMIT ? OFFSET ?""",
-            (*params, limit + 1, offset)).fetchall()
-        return rows[:limit], total, len(rows) > limit
+        return self.conn.execute(
+            "SELECT COUNT(*) AS n FROM outbox WHERE state = 'pending'"
+        ).fetchone()["n"]
 
     def device_users(self, serial=None):
         """The roster, ordered by user ID numerically where it is a number."""
@@ -1557,6 +1555,84 @@ class InfinoSink:
             return DeliveryResult(ok=False, error="timeout")
         except Exception as e:                       # never kill the worker
             return DeliveryResult(ok=False, error=f"{type(e).__name__}: {e}")
+
+
+class InfinoQueryError(Exception):
+    """A read from Infino failed. Carries an HTTP status to hand back."""
+
+    def __init__(self, message, status=502):
+        super().__init__(message)
+        self.status = status
+
+
+class InfinoQuery:
+    """
+    Read side of Infino: `POST /v1/query_sql/{database}` with `{"query": …}`.
+
+    SQL is read-only there by design, the dialect is Apache DataFusion
+    (Postgres-leaning, with CTEs, JOINs, GROUP BY and window functions), and
+    with `Accept: application/json` the body comes back as a plain array of
+    row objects:
+
+        [{"employee_user_id": "9", "punched_at_local": "2026-08-09 16:30:45"}]
+
+    Two things that shape every caller: a NULL column is *omitted* from the
+    row object rather than returned as null, so reads must use .get(); and
+    Infino has no idempotency on append, so a retry after an ambiguous failure
+    can write a row twice — every query here dedups on `event_id` (M3.6).
+    """
+
+    def __init__(self, cfg):
+        self.base = cfg.infino_url
+        self.database = cfg.infino_database
+        self.api_key = cfg.infino_api_key
+        self.timeout = cfg.infino_timeout
+
+    @property
+    def configured(self):
+        return bool(self.database and self.api_key)
+
+    def rows(self, sql):
+        """Run a query and return a list of dicts. Raises InfinoQueryError."""
+        if not self.configured:
+            raise InfinoQueryError(
+                "Infino is not configured: set ZK_INFINO_DATABASE and "
+                "ZK_INFINO_API_KEY. Attendance is read from the cloud, so "
+                "there is nothing to serve without them.", 503)
+        url = f"{self.base}/v1/query_sql/{self.database}"
+        req = urllib.request.Request(
+            url, data=json.dumps({"query": sql}).encode("utf-8"), method="POST")
+        req.add_header("Content-Type", "application/json")
+        # Without this the response is an Arrow IPC stream, which would mean
+        # taking a dependency on pyarrow to read our own attendance.
+        req.add_header("Accept", "application/json")
+        req.add_header("Authorization", f"Bearer {self.api_key}")
+        req.add_header("User-Agent", USER_AGENT)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = resp.read()
+        except urllib.error.HTTPError as e:
+            detail = InfinoSink._describe(e)
+            if e.code == 503:
+                # Documented cold start: the database is spinning up.
+                raise InfinoQueryError(
+                    f"Infino is starting up, retry shortly ({detail})", 503)
+            if e.code == 401:
+                raise InfinoQueryError("Infino rejected the API key", 502)
+            raise InfinoQueryError(detail, 502)
+        except urllib.error.URLError as e:
+            raise InfinoQueryError(f"cannot reach Infino: {e.reason}", 502)
+        except TimeoutError:
+            raise InfinoQueryError("Infino timed out", 504)
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            raise InfinoQueryError("Infino returned a non-JSON body", 502)
+        if not isinstance(parsed, list):
+            raise InfinoQueryError(
+                f"expected a JSON array of rows, got {type(parsed).__name__}",
+                502)
+        return parsed
 
 
 def build_sinks(cfg):
@@ -1814,6 +1890,7 @@ class Handler(BaseHTTPRequestHandler):
     worker = None
     directory = None
     arrivals = None
+    query = None
     started_at = time.monotonic()
 
     protocol_version = "HTTP/1.0"    # terminals don't benefit from keep-alive
@@ -2074,17 +2151,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def _attendance(self, q):
         """
-        Attendance as JSON, filtered.
+        Attendance as JSON: one row per person per day, read from Infino.
 
             /attendance?date=2026-08-09
             /attendance?user_id=3&from=2026-08-01&to=2026-08-09
             /attendance?limit=500&offset=500&order=asc
 
-        `name` is resolved from the directory as it stands *now*, so a renamed
-        person reads back under their current name. That is the opposite of
-        the `arrivals` rows in Infino, which deliberately freeze identity at
-        the moment someone walked in — use those when you need to know what
-        was true then.
+        Attendance is a daily summary, not a list of punches: when someone
+        first appeared, when they were last seen, and how many times the
+        reader caught them. `/punches` is still there for the raw events.
+
+        Infino is the source of record. SQLite is a delivery buffer on the way
+        there, so it is deliberately not consulted here — reading it would
+        answer a subtly different question depending on how far the outbox had
+        drained. The pending count is reported instead, so a caller can tell
+        the difference between "nobody came in" and "nothing has shipped yet".
         """
         limit = self._int_param(q, "limit", 100, 1, 1000)
         if limit is None:
@@ -2117,45 +2198,123 @@ class Handler(BaseHTTPRequestHandler):
             return self._reply("order must be asc or desc\n", 400)
 
         user_id = q.get("user_id", [""])[0].strip()
+        if user_id and not _SAFE_FILTER_RE.fullmatch(user_id):
+            return self._reply("user_id must be alphanumeric\n", 400)
         serial = q.get("sn", [""])[0].strip()
-        rows, total, has_more = self.store.attendance(
-            user_id=user_id or None, serial=serial or None,
-            date_from=date_from or None, date_to=date_to or None,
-            limit=limit, offset=offset, newest_first=(order == "desc"))
+        if serial and not _SAFE_FILTER_RE.fullmatch(serial):
+            return self._reply("sn must be alphanumeric\n", 400)
 
+        where = []
+        if user_id:
+            where.append(f"employee_user_id = {_sql_text(user_id)}")
+        if serial:
+            where.append(f"device_serial = {_sql_text(serial)}")
+        if date_from:
+            where.append(f"local_date >= {_sql_text(date_from)}")
+        if date_to:
+            where.append(f"local_date <= {_sql_text(date_to)}")
+        clause = ("WHERE " + " AND ".join(where)) if where else ""
+        direction = "DESC" if order == "desc" else "ASC"
+
+        try:
+            total = self.query.rows(
+                f"SELECT COUNT(*) AS n FROM (SELECT DISTINCT "
+                f"employee_user_id, local_date FROM "
+                f"{self.cfg.infino_table} {clause}) t")
+            rows = self.query.rows(
+                self._attendance_sql(clause, direction, limit + 1, offset))
+        except InfinoQueryError as e:
+            LOG.warning("attendance query failed: %s", e)
+            return self._reply_json(
+                {"error": str(e),
+                 "hint": "Attendance is read from Infino; SQLite is only the "
+                         "delivery buffer. Check /status for the outbox.",
+                 "pending_delivery": self.store.pending_delivery()},
+                e.status)
+
+        has_more = len(rows) > limit
         return self._reply_json({
+            "source": {"infino_database": self.cfg.infino_database,
+                       "attendance_table": self.cfg.infino_table,
+                       "arrivals_table": self.cfg.infino_arrivals_table},
             "filters": {"user_id": user_id or None, "serial": serial or None,
                         "from": date_from or None, "to": date_to or None,
                         "order": order},
-            "total": total,
-            "returned": len(rows),
+            "total": total[0].get("n", 0) if total else 0,
+            "returned": min(len(rows), limit),
             "limit": limit,
             "offset": offset,
             "has_more": has_more,
+            # Not yet in Infino, therefore not in the numbers above.
+            "pending_delivery": self.store.pending_delivery(),
             "redacted": self.cfg.redact_pins,
-            "punches": [self._attendance_json(r) for r in rows],
+            "attendance": [self._attendance_json(r) for r in rows[:limit]],
         })
 
+    def _attendance_sql(self, clause, direction, limit, offset):
+        """
+        One row per person per day.
+
+        `deduped` is not optional: Infino has no idempotency on append, so a
+        retry after an ambiguous failure can land the same punch twice, and
+        every count downstream would inherit it (M3.6).
+
+        Identity is joined from the arrivals table rather than the local
+        directory, so the answer is the same whoever asks and does not shift
+        when directory.json is edited.
+        """
+        return f"""
+        WITH deduped AS (
+          SELECT DISTINCT event_id, employee_user_id, local_date,
+                          punched_at_local
+            FROM {self.cfg.infino_table}
+            {clause}
+        ),
+        days AS (
+          SELECT employee_user_id AS user_id,
+                 local_date,
+                 MIN(punched_at_local) AS first_seen_local,
+                 MAX(punched_at_local) AS last_seen_local,
+                 COUNT(*) AS punches
+            FROM deduped
+           GROUP BY employee_user_id, local_date
+        ),
+        people AS (
+          SELECT employee_user_id AS user_id,
+                 MAX(person_name) AS person_name,
+                 MAX(slack_id) AS slack_id,
+                 MAX(github_id) AS github_id
+            FROM {self.cfg.infino_arrivals_table}
+           GROUP BY employee_user_id
+        )
+        SELECT d.user_id, d.local_date, p.person_name, p.slack_id, p.github_id,
+               d.first_seen_local, d.last_seen_local, d.punches
+          FROM days d LEFT JOIN people p ON d.user_id = p.user_id
+         ORDER BY d.local_date {direction}, d.user_id {direction}
+         LIMIT {int(limit)} OFFSET {int(offset)}
+        """
+
     def _attendance_json(self, row):
-        person = self.directory.get(row["user_id"])
+        """
+        One day for one person. A NULL column is absent from Infino's row
+        object rather than null, so every read here goes through .get().
+        """
         redact = self.cfg.redact_pins
+        first = row.get("first_seen_local")
+        last = row.get("last_seen_local")
         return {
-            # The same id the Infino rows carry, so these join to both tables.
-            "event_id": row["dedup_key"],
-            "user_id": self._user_id_for_log(row["user_id"]),
-            "name": None if redact else (person.name or None) if person
-                    else None,
-            "serial": row["serial"],
-            "punched_local": row["punched_local"],
-            "punched_utc": row["punched_utc"],
-            "local_date": row["local_date"],
-            "direction": PUNCH_STATUS.get(row["status"],
-                                          f"unknown_{row['status']}"),
-            "status_code": row["status"],
-            "verify_method": VERIFY_METHOD.get(row["verify"],
-                                               f"unknown_{row['verify']}"),
-            "workcode": row["workcode"],
-            "received_utc": row["received_utc"],
+            "user_id": self._user_id_for_log(str(row.get("user_id", ""))),
+            "local_date": row.get("local_date"),
+            "name": None if redact else row.get("person_name"),
+            "slack_id": None if redact else row.get("slack_id"),
+            "github_id": None if redact else row.get("github_id"),
+            "first_seen_local": first,
+            "last_seen_local": last,
+            "punches": row.get("punches", 0),
+            # The span between the first and last sighting — not a sum of
+            # in/out pairs. This terminal reports no direction at all (every
+            # punch is status 255), so pairing them up would be invention.
+            "minutes_on_site": _minutes_between(first, last),
         }
 
     # ---- user roster ---------------------------------------------------
@@ -2566,6 +2725,7 @@ def main(argv=None):
     Handler.worker = worker
     Handler.directory = directory
     Handler.arrivals = ArrivalDebounce()
+    Handler.query = InfinoQuery(cfg)
     Handler.started_at = time.monotonic()
 
     try:

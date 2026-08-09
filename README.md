@@ -58,9 +58,9 @@ they don't exist:
 | `arrivals` | one row per arrival | the same event plus `person_name`, `slack_id`, `github_id` from the directory |
 
 `event_id` is the same in both, so they join. Identity is copied onto the
-arrival row rather than referenced: Infino is append-only, so there is no
-`UPDATE` to repair a stale join, and a row recording who someone was when they
-arrived stays true after they change their Slack handle. Someone with no
+arrival row rather than referenced, so it records who someone was when they
+arrived and stays true after they change their Slack handle — a point-in-time
+answer, which is the one you want for an attendance record. Someone with no
 directory entry still gets a row, with nulls and `identity_source='unmapped'` —
 "arrivals we cannot name" is worth being able to query.
 
@@ -93,8 +93,8 @@ Operator endpoints (`?token=` or an `X-Auth-Token` header):
 | --- | --- |
 | `/healthz` | Liveness. No token, no personal data. 503 when the device has gone quiet or deliveries are dead-lettered. |
 | `/status` | Devices, queue depth, delivery counters |
-| `/punches?limit=20` | Most recent stored punches — a quick look, no filters |
-| `/attendance` | Attendance as JSON, filtered and paged — see below |
+| `/punches?limit=20` | Most recent punches in the local delivery buffer — a quick look |
+| `/attendance` | Attendance from Infino: one row per person per day — see below |
 | `/users/sync` | Ask the terminal to upload its user table (run by hand) |
 | `/users` | Read back that user table |
 | `/open?door=1&sec=5` | Momentary unlock |
@@ -122,30 +122,38 @@ curl "…/attendance?token=…&limit=500&offset=500"
 | `limit=` / `offset=` | Page size (1–1000, default 100) and offset |
 | `order=asc\|desc` | Oldest or newest first (default `desc`) |
 
+One row per person per day — a daily summary, not a list of events. Use
+`/punches` for the raw punches.
+
 ```json
 {
-  "filters": {"user_id": "3", "from": "2026-08-01", "to": "2026-08-09", "order": "asc"},
-  "total": 12, "returned": 12, "limit": 100, "offset": 0, "has_more": false,
-  "punches": [{
-    "event_id": "c20f30418f563eb8129d9cf6c23c701b",
-    "user_id": "3", "name": "Pranav", "serial": "NYU7261200921",
-    "punched_local": "2026-08-09 16:49:19", "punched_utc": "2026-08-09T11:19:19Z",
-    "local_date": "2026-08-09", "direction": "unspecified", "status_code": 255,
-    "verify_method": "fingerprint", "workcode": "0",
-    "received_utc": "2026-08-09T11:19:21Z"
+  "source": {"infino_database": "office-bot-test",
+             "attendance_table": "attendance", "arrivals_table": "arrivals"},
+  "filters": {"user_id": null, "from": null, "to": null, "order": "desc"},
+  "total": 2, "returned": 2, "limit": 100, "offset": 0, "has_more": false,
+  "pending_delivery": 0, "redacted": false,
+  "attendance": [{
+    "user_id": "9", "local_date": "2026-08-09", "name": "Ajay",
+    "slack_id": null, "github_id": null,
+    "first_seen_local": "2026-08-09 16:30:44",
+    "last_seen_local": "2026-08-09 16:30:45",
+    "punches": 2, "minutes_on_site": 0
   }]
 }
 ```
 
-`total` is the full count matching the filter, `returned` is this page.
-`event_id` is the same id the Infino rows carry, so these join to both cloud
-tables. Reads come from SQLite, not Infino: it is the source of truth that
-feeds the cloud, it is complete even while the outbox is draining, and it
-needs no network.
+**Infino is the source of record.** SQLite is only the delivery buffer on the
+way there, so it is not consulted: reading it would answer a subtly different
+question depending on how far the outbox had drained. `pending_delivery` is
+reported alongside every response so a caller can tell "nobody came in" from
+"nothing has shipped yet". If Infino is unreachable the endpoint returns 502
+rather than quietly falling back to local data.
 
-`name` is resolved from the directory **as it stands now**, so a renamed
-person reads back under their current name — the opposite of the `arrivals`
-rows, which deliberately freeze identity at the moment someone walked in.
+`punches` counts distinct `event_id`s — Infino has no idempotency on append,
+so a retry can land the same row twice and every reader has to dedup.
+`minutes_on_site` is the span from first to last sighting, **not** a sum of
+in/out pairs: a terminal that reports no direction (every punch is status
+`255`) gives nothing to pair up.
 
 ### Who just walked in
 
