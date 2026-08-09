@@ -164,6 +164,43 @@ so a retry can land the same row twice and every reader has to dedup.
 in/out pairs: a terminal that reports no direction (every punch is status
 `255`) gives nothing to pair up.
 
+### The good-morning DM
+
+When someone's first punch of the day lands, they get a Slack DM:
+
+> **Good morning, Pranav!** :sunny:
+> _You get this when you arrive at the office._
+
+No check-in time in the message. The server knows it to the second, but
+quoting it back turns a greeting into a timesheet.
+
+Setup, in order:
+
+1. Create a Slack app, add the **`chat:write`** and **`im:write`** bot scopes,
+   install it to the workspace, and copy the `xoxb-` bot token.
+2. `ZK_SLACK_BOT_TOKEN=xoxb-…`
+3. Put each person's Slack **member ID** (`U…`, not their @handle) in
+   `directory.json` — Profile → More → Copy member ID.
+4. `ZK_SINKS=…,log_slack` first. This renders the message and prints it
+   without sending anything, which is how to iterate on the wording.
+5. `ZK_SINKS=…,slack` to actually send, with `ZK_SLACK_ALLOW=3,9` limiting it
+   to a couple of volunteers. **An empty `ZK_SLACK_ALLOW` means everyone in
+   the directory** — it warns loudly at startup.
+
+Exactly one DM per person per day: the `arrivals` table is the ledger, so a
+restart, a re-upload, or the reader matching the same face twice all collapse
+to one message. The DM is sent *after* the arrival row is written, so a Slack
+outage costs someone one greeting rather than sending them a duplicate
+tomorrow — a missed DM beats a repeated one when the recipient is a colleague.
+
+A Slack failure never affects attendance: the punch is already recorded, and
+the greeting is logged at `ERROR` and abandoned. Rate limits (429) get one
+retry on Slack's own `Retry-After`; `missing_scope`, `user_not_found` and
+friends are treated as permanent and not retried.
+
+The GitHub and Slack "pending work" sections are phases 6 and 7 — this is the
+frame they slot into.
+
 ### Who just walked in
 
 The terminal only knows a user ID. To turn that into a person, point

@@ -290,8 +290,9 @@ single face match, which is why the cooldown below is not optional.
   failure rather than sending nothing.
 
 ### Phase 7 — Slack pending work
-- [ ] **M7.1** Slack app + manifest; scopes `chat:write`, `im:write`,
-  `users:read`, `users:read.email`.
+- [~] **M7.1** Slack app needs `chat:write` and `im:write` for the DM; the
+  `users:read*` scopes are only needed if we ever resolve emails to IDs, which
+  the hand-maintained directory avoids for now.
 - [ ] **M7.2** **Resolve early:** `search.messages` requires a *user* token, not
   a bot token, and there is no bot-accessible "unread mentions" API. Realistic
   options are (a) a user token per person, (b) subscribe to `app_mention` /
@@ -302,14 +303,20 @@ single face match, which is why the cooldown below is not optional.
 - [ ] **M7.4** Thread-aware dedup so one conversation isn't five bullets.
 
 ### Phase 8 — The message
-- [ ] **M8.1** Block Kit template: greeting, GitHub section, Slack section,
-  empty state that reads as good news rather than an error.
+- [x] **M8.1** Block Kit template: greeting + context footer saying where the
+  message came from. The GitHub and Slack sections are the gap phases 6-7
+  fill; the empty state is currently the whole message.
 - [ ] **M8.2** Renderer with golden tests (empty, one item, overflowing,
   partial-failure).
-- [ ] **M8.3** Send via `conversations.open` + `chat.postMessage`, with retry,
-  429 `Retry-After` handling, and graceful handling of deactivated users.
+- [x] **M8.3** Sent via `conversations.open` (channel cached) + 
+  `chat.postMessage`. Slack signals failure with HTTP 200 and `ok:false`, so
+  every response is inspected; 429 gets one retry on its own `Retry-After`;
+  `user_not_found` / `account_inactive` / `missing_scope` and friends are
+  permanent and not retried. A failure never affects the punch.
 - [ ] **M8.4** Opt-out path and a footer saying where the data came from.
 - [ ] **M8.5** Pilot with two or three volunteers before enabling org-wide.
+  `ZK_SLACK_ALLOW` is the gate; an empty value means everyone and warns at
+  startup. **Not yet run against real Slack — no token has been issued.**
 
 ### Phase 9 — Operations
 - [ ] **M9.1** systemd unit: `Restart=always`, env file with `0600`, log

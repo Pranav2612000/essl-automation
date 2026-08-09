@@ -124,7 +124,10 @@ LOG = logging.getLogger("essl")
 # for every configured sink of the kind it qualifies for.
 ATTENDANCE_SINKS = frozenset({"log", "infino"})
 ARRIVAL_SINKS = frozenset({"log_arrivals", "infino_arrivals"})
-KNOWN_SINKS = ATTENDANCE_SINKS | ARRIVAL_SINKS
+# 'slack' sends a real DM to a real person. 'log_slack' renders the message
+# and prints it, which is the only way to iterate on wording safely.
+GREETING_SINKS = frozenset({"log_slack", "slack"})
+KNOWN_SINKS = ATTENDANCE_SINKS | ARRIVAL_SINKS | GREETING_SINKS
 
 # ATTLOG status codes (byte 3 of each record).
 PUNCH_STATUS = {
@@ -298,6 +301,9 @@ class Config:
     infino_table: str
     infino_arrivals_table: str
     infino_users_table: str
+    slack_bot_token: str
+    slack_allow: frozenset
+    slack_timeout: float
     infino_api_key: str
     infino_timeout: float
     infino_bootstrap: bool
@@ -353,6 +359,11 @@ class Config:
                                                  "arrivals"),
             infino_users_table=os.environ.get("ZK_INFINO_USERS_TABLE",
                                               "device_users"),
+            slack_bot_token=os.environ.get("ZK_SLACK_BOT_TOKEN", "").strip(),
+            slack_allow=frozenset(
+                u.strip() for u in
+                os.environ.get("ZK_SLACK_ALLOW", "").split(",") if u.strip()),
+            slack_timeout=_env_float("ZK_SLACK_TIMEOUT", 10.0),
             # INFINO_API_KEY is the name Infino's own SDKs read, so accept it.
             infino_api_key=(os.environ.get("ZK_INFINO_API_KEY", "")
                             or os.environ.get("INFINO_API_KEY", "")),
@@ -396,6 +407,28 @@ class Config:
         elif len(self.auth_token) < 16:
             raise ConfigError("ZK_AUTH_TOKEN is shorter than 16 characters; "
                               "generate one with secrets.token_urlsafe(24)")
+        if "slack" in self.sinks:
+            if not self.slack_bot_token:
+                raise ConfigError(
+                    "ZK_SINKS includes 'slack' but ZK_SLACK_BOT_TOKEN is not "
+                    "set. Create a Slack app with chat:write and im:write, "
+                    "install it, and use its xoxb- bot token.")
+            if not self.slack_bot_token.startswith("xoxb-"):
+                LOG.warning("ZK_SLACK_BOT_TOKEN does not start with 'xoxb-' — "
+                            "a user token (xoxp-) posts as a person, not the "
+                            "app; check which one you copied")
+            if not self.slack_allow:
+                LOG.warning("ZK_SINKS includes 'slack' with an empty "
+                            "ZK_SLACK_ALLOW: EVERY person in the directory "
+                            "with a slack id will be DMed on arrival. Set "
+                            "ZK_SLACK_ALLOW to a few user IDs to pilot first.")
+            else:
+                LOG.info("Slack DMs are limited to user ID(s): %s",
+                         ", ".join(sorted(self.slack_allow)))
+        elif self.slack_bot_token:
+            LOG.warning("ZK_SLACK_BOT_TOKEN is set but ZK_SINKS has no "
+                        "'slack', so no message will be sent. Use 'log_slack' "
+                        "to see what would be.")
         # The arrivals table is the greeting ledger. Without the sink that
         # writes it, "once a day" holds only for as long as this process
         # lives — fine for a dry run, but say so rather than let someone
@@ -1243,11 +1276,14 @@ class Publisher:
     behind it.
     """
 
-    def __init__(self, cfg, client):
+    def __init__(self, cfg, client, slack=None):
         self.cfg = cfg
         self.client = client
+        self.slack = slack
         self.dropped = 0
         self.appended = 0
+        self.greeted = 0
+        self.greet_failures = 0
 
     def _emit(self, cloud_sink, log_sink, table, rows, kind):
         if not rows:
@@ -1284,8 +1320,173 @@ class Publisher:
         self._emit("infino_arrivals", "log_arrivals",
                    self.cfg.infino_arrivals_table, rows, "arrival")
 
+    def greet(self, arrival):
+        """
+        DM the person who just arrived.
+
+        Called *after* the arrival row is in the ledger, so the ordering is
+        deliberate: a failure here means one missed greeting, whereas greeting
+        first and failing to record it would mean greeting again tomorrow's
+        first punch and every re-upload in between. A missed DM beats a
+        repeated one when the recipient is a colleague.
+
+        Never raises. Attendance is the job; the greeting is not worth
+        refusing a punch over.
+        """
+        text, blocks = greeting_message(arrival)
+        user_id = arrival.get("employee_user_id")
+        slack_id = arrival.get("slack_id")
+
+        if "log_slack" in self.cfg.sinks:
+            LOG.info("[log_slack] -> %s (%s): %s",
+                     arrival.get("person_name") or user_id,
+                     slack_id or "no slack id", text)
+        if "slack" not in self.cfg.sinks:
+            return
+        if not slack_id:
+            LOG.info("no DM for user %s: no slack id in the directory",
+                     user_id)
+            return
+        # The pilot gate. Empty means everyone, which validate() warns about.
+        if self.cfg.slack_allow and user_id not in self.cfg.slack_allow:
+            LOG.info("no DM for user %s: not in ZK_SLACK_ALLOW", user_id)
+            return
+        try:
+            self.slack.send_dm(slack_id, text, blocks)
+            self.greeted += 1
+            LOG.info("DM sent to %s (%s)",
+                     arrival.get("person_name") or user_id, slack_id)
+        except SlackError as e:
+            self.greet_failures += 1
+            LOG.error("DM to %s (%s) failed: %s%s",
+                      arrival.get("person_name") or user_id, slack_id, e,
+                      "" if e.permanent else " — not retried, they will be "
+                      "greeted again tomorrow")
+
     def publish_users(self, rows):
         self._emit("infino", "log", self.cfg.infino_users_table, rows, "user")
+
+
+class SlackError(Exception):
+    """A Slack call failed. `permanent` means retrying will not help."""
+
+    def __init__(self, message, permanent=False, retry_after=0.0):
+        super().__init__(message)
+        self.permanent = permanent
+        self.retry_after = retry_after
+
+
+# Slack errors that mean "this person cannot be messaged, ever" as opposed to
+# "try again". Retrying these just burns rate limit and fills the log.
+_SLACK_FATAL = {
+    "user_not_found", "users_not_found", "user_disabled", "account_inactive",
+    "cannot_dm_bot", "is_bot", "channel_not_found", "not_in_channel",
+    "invalid_auth", "token_revoked", "missing_scope", "no_permission",
+    "restricted_action",
+}
+
+
+class SlackClient:
+    """
+    Sends a direct message: `conversations.open` to get the DM channel for a
+    person, then `chat.postMessage` into it.
+
+    Slack signals failure with HTTP 200 and `{"ok": false, "error": "..."}`,
+    so the status code alone tells you nothing — every response is inspected.
+    A 429 carries `Retry-After`, which is honoured once; a greeting is not
+    worth holding the device's request thread open longer than that.
+    """
+
+    BASE = os.environ.get("ZK_SLACK_API_URL",
+                          "https://slack.com/api").rstrip("/")
+
+    def __init__(self, cfg):
+        self.token = cfg.slack_bot_token
+        self.timeout = cfg.slack_timeout
+        self._dm_channels = {}          # slack user id -> channel id
+        self._lock = threading.Lock()
+
+    def _post(self, method, payload):
+        req = urllib.request.Request(
+            f"{self.BASE}/{method}",
+            data=json.dumps(payload).encode("utf-8"), method="POST")
+        req.add_header("Content-Type", "application/json; charset=utf-8")
+        req.add_header("Authorization", f"Bearer {self.token}")
+        req.add_header("User-Agent", USER_AGENT)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                try:
+                    wait = float(e.headers.get("Retry-After", 1) or 1)
+                except (TypeError, ValueError):
+                    wait = 1.0
+                raise SlackError(f"{method}: rate limited", retry_after=wait)
+            raise SlackError(f"{method}: HTTP {e.code}")
+        except urllib.error.URLError as e:
+            raise SlackError(f"{method}: cannot reach Slack: {e.reason}")
+        except TimeoutError:
+            raise SlackError(f"{method}: timed out")
+        except ValueError:
+            raise SlackError(f"{method}: response was not JSON")
+        if not body.get("ok"):
+            err = str(body.get("error", "unknown"))
+            raise SlackError(f"{method}: {err}", permanent=err in _SLACK_FATAL)
+        return body
+
+    def dm_channel(self, slack_id):
+        """The DM channel for a person, cached — it never changes."""
+        with self._lock:
+            cached = self._dm_channels.get(slack_id)
+        if cached:
+            return cached
+        body = self._post("conversations.open", {"users": slack_id})
+        channel = (body.get("channel") or {}).get("id")
+        if not channel:
+            raise SlackError("conversations.open returned no channel",
+                             permanent=True)
+        with self._lock:
+            self._dm_channels[slack_id] = channel
+        return channel
+
+    def send_dm(self, slack_id, text, blocks=None):
+        channel = self.dm_channel(slack_id)
+        payload = {"channel": channel, "text": text}
+        if blocks:
+            payload["blocks"] = blocks
+        try:
+            return self._post("chat.postMessage", payload)
+        except SlackError as e:
+            if e.permanent or not e.retry_after:
+                raise
+            # One retry, on Slack's own schedule.
+            time.sleep(min(e.retry_after, 5.0))
+            return self._post("chat.postMessage", payload)
+
+
+def greeting_message(arrival):
+    """
+    The good-morning DM.
+
+    Deliberately thin: the GitHub and Slack "pending work" sections are phases
+    6 and 7, and this is the frame they will slot into.
+
+    No check-in time, deliberately. The server knows it to the second, but
+    quoting it back turns a greeting into a timesheet — the point is to open
+    someone's day, not to tell them they were noticed arriving. The footer
+    stays, because an unexplained DM from a bot at 9am reads as spam.
+    """
+    name = arrival.get("person_name") or "there"
+    text = f"Good morning, {name}!"
+    blocks = [
+        {"type": "section",
+         "text": {"type": "mrkdwn", "text": f"*Good morning, {name}!* :sunny:"}},
+        {"type": "context",
+         "elements": [{"type": "mrkdwn",
+                       "text": "You get this when you arrive at the office."}]},
+    ]
+    return text, blocks
 
 
 class GreetingGuard:
@@ -1636,6 +1837,7 @@ class Handler(BaseHTTPRequestHandler):
                      VERIFY_METHOD.get(punch.verify, punch.verify))
         for arrival in arrivals:
             self._log_arrival(arrival)
+            self.publisher.greet(arrival)
 
         LOG.info("ATTLOG batch from SN=%s: %d published (%d arrival(s)), "
                  "%d malformed", serial, len(punches), len(arrivals), malformed)
@@ -2042,6 +2244,9 @@ class Handler(BaseHTTPRequestHandler):
                 "queued_commands": self.queue.snapshot(),
                 "published_this_run": self.publisher.appended,
                 "dropped_this_run": self.publisher.dropped,
+                "greetings": {"sent_this_run": self.publisher.greeted,
+                              "failed_this_run": self.publisher.greet_failures,
+                              "allowlist": sorted(self.cfg.slack_allow) or None},
             })
 
         if path == "/punches":
@@ -2334,7 +2539,7 @@ def main(argv=None):
         return 0
 
     client = InfinoClient(cfg)
-    publisher = Publisher(cfg, client)
+    publisher = Publisher(cfg, client, SlackClient(cfg))
     tables = {cfg.infino_table: INFINO_TABLE_SCHEMA,
               cfg.infino_arrivals_table: INFINO_ARRIVALS_SCHEMA,
               cfg.infino_users_table: INFINO_USERS_SCHEMA}
