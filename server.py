@@ -121,7 +121,16 @@ PUNCH_STATUS = {
     3: "break_in",
     4: "overtime_in",
     5: "overtime_out",
+    # Sent when the terminal's attendance-state feature is off, so it has no
+    # direction to report. Most eSSL units ship that way and send it for every
+    # punch — this is the common case, not a fault.
+    255: "unspecified",
 }
+# Statuses that mean the person is leaving. Everything else counts as an
+# arrival, including "unspecified": when the device declines to say, the
+# useful default is to treat a punch as someone showing up. Phase 5's
+# first-punch-of-day rule is what will make that precise.
+DEPARTURE_STATUS = frozenset({1, 2, 5})     # check_out, break_out, overtime_out
 # Verification method (byte 4). Firmware-dependent beyond these.
 VERIFY_METHOD = {
     0: "password",
@@ -758,6 +767,51 @@ class Directory:
                                      github=_first_value(body, _GITHUB_KEYS))
         self._people = people
         return self
+
+
+# How long after announcing someone's arrival to stay quiet about them. Long
+# enough to swallow a reader that matches twice, short enough that a genuine
+# re-entry still shows up.
+ARRIVAL_DEBOUNCE_SECS = 60
+
+
+class ArrivalDebounce:
+    """
+    Collapses repeat arrivals for the same person within a short window.
+
+    A face reader can match twice in consecutive seconds, and the terminal
+    faithfully reports both. They are two real punches and both belong in the
+    database — it is only the announcement that should not be doubled.
+
+    Keyed on the punch's own timestamp rather than the clock, so draining a
+    backlog behaves like live traffic. Deliberately in memory: this is a
+    debounce, not the once-per-day guard. That one has to survive a restart,
+    which is why ROADMAP M5.2 puts it in SQLite instead.
+    """
+
+    def __init__(self, window_secs=ARRIVAL_DEBOUNCE_SECS):
+        self.window = datetime.timedelta(seconds=window_secs)
+        self._lock = threading.Lock()
+        self._last = {}         # (serial, user_id) -> datetime of last announce
+
+    def should_announce(self, serial, user_id, punched_utc):
+        """True if this arrival is far enough from the last one to be worth
+        saying out loud. An unparseable timestamp always announces: losing a
+        greeting is worse than repeating one."""
+        if not punched_utc:
+            return True
+        try:
+            when = datetime.datetime.strptime(punched_utc, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            return True
+        key = (serial, user_id)
+        with self._lock:
+            previous = self._last.get(key)
+            # abs() so an out-of-order upload cannot re-open the window.
+            if previous is not None and abs(when - previous) < self.window:
+                return False
+            self._last[key] = when
+            return True
 
 
 # --------------------------------------------------------------------------
@@ -1510,6 +1564,7 @@ class Handler(BaseHTTPRequestHandler):
     registry = None
     worker = None
     directory = None
+    arrivals = None
     started_at = time.monotonic()
 
     protocol_version = "HTTP/1.0"    # terminals don't benefit from keep-alive
@@ -1687,20 +1742,25 @@ class Handler(BaseHTTPRequestHandler):
         Say who just walked in. Called once per *new* punch, so a device
         re-uploading a batch cannot repeat the line.
 
-        Only check-ins are announced — "entered office" is false for a
-        check-out. Most eSSL terminals report every punch as a check-in unless
-        someone presses a mode key, so in practice this fires on all of them;
-        the DEBUG line below is what to look at if it unexpectedly does not.
+        Anything that is not explicitly a departure counts as an arrival. Many
+        terminals never report a direction at all — they send status 255 — so
+        requiring an explicit check-in would mean never announcing anyone.
 
-        This is not yet the once-a-day greeting: a second check-in after lunch
-        announces again. First-punch-of-day and its idempotency guard are
-        ROADMAP M5.1 and M5.2.
+        This is not yet the once-a-day greeting: a second arrival after lunch
+        announces again, subject only to the short debounce. First-punch-of-day
+        and its durable idempotency guard are ROADMAP M5.1 and M5.2.
         """
-        if punch.direction != "check_in":
+        if punch.status in DEPARTURE_STATUS:
             LOG.debug("no arrival line for %s: direction is %s",
                       self._user_id_for_log(punch.user_id), punch.direction)
             return
         if self.cfg.redact_pins:
+            return
+        if not self.arrivals.should_announce(punch.serial, punch.user_id,
+                                             punch.punched_utc):
+            LOG.debug("arrival for %s already announced within %ds",
+                      self._user_id_for_log(punch.user_id),
+                      ARRIVAL_DEBOUNCE_SECS)
             return
         person = self.directory.get(punch.user_id)
         if person is None:
@@ -2110,6 +2170,7 @@ def main(argv=None):
     Handler.registry = DeviceRegistry()
     Handler.worker = worker
     Handler.directory = directory
+    Handler.arrivals = ArrivalDebounce()
     Handler.started_at = time.monotonic()
 
     try:

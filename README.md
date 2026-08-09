@@ -106,6 +106,13 @@ An unknown user ID logs a warning naming the file to add them to, and never
 interferes with recording the punch. A malformed file stops startup, so
 `--check-config` catches a typo rather than a Monday morning does.
 
+Any punch that isn't explicitly a departure counts as an arrival. Terminals
+with their attendance-state feature switched off — the default on most eSSL
+units — report every punch as status `255`, meaning they have no direction to
+report at all, so requiring an explicit check-in would announce nobody. A
+reader that matches the same face twice in consecutive seconds stores both
+punches but announces once.
+
 ## Setup
 
 ```bash

@@ -203,10 +203,17 @@ startup.
 - [ ] **M4.5** Move the directory to Infino cloud behind the same interface.
 
 ### Phase 5 — First-punch-of-day trigger
-An arrival line already prints on every new check-in
+An arrival line already prints on every new punch that is not a departure
 (`"<name> entered office. slack: … github: …"`), which is the shape the DM
-will take. What phase 5 adds is *when*: once per person per day rather than on
-every check-in, and off the request path.
+will take, debounced 60s in memory against a double-reading reader. What phase
+5 adds is *when*: once per person per day, durably, and off the request path.
+
+**Observed on the real terminal (NYU7261200921):** every punch arrives with
+`status=255` and `verify=15` — the attendance-state feature is off, so the
+device reports no direction at all. `status == check_in` is therefore *not* a
+usable trigger here; M5.1 must key off the first punch of the day rather than
+a direction. The same reader also produced two punches one second apart for a
+single face match, which is why the cooldown below is not optional.
 
 - [ ] **M5.1** Define it precisely: `status == check_in`, first row for
   `(user_id, local_date)`, plus a cooldown so a double-tap at the reader
