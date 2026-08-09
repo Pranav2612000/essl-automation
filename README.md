@@ -176,8 +176,11 @@ quoting it back turns a greeting into a timesheet.
 
 Setup, in order:
 
-1. Create a Slack app, add the **`chat:write`** and **`im:write`** bot scopes,
-   install it to the workspace, and copy the `xoxb-` bot token.
+1. Create a Slack app, add the **`chat:write`** bot scope, install it to the
+   workspace, and copy the `xoxb-` bot token. That one scope is enough:
+   `chat.postMessage` opens the DM itself when given a user ID, so `im:write`
+   is not needed. Adding a scope later only takes effect after **reinstalling**
+   the app.
 2. `ZK_SLACK_BOT_TOKEN=xoxb-…`
 3. Put each person's Slack **member ID** (`U…`, not their @handle) in
    `directory.json` — Profile → More → Copy member ID.

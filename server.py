@@ -411,7 +411,7 @@ class Config:
             if not self.slack_bot_token:
                 raise ConfigError(
                     "ZK_SINKS includes 'slack' but ZK_SLACK_BOT_TOKEN is not "
-                    "set. Create a Slack app with chat:write and im:write, "
+                    "set. Create a Slack app with the chat:write bot scope, "
                     "install it, and use its xoxb- bot token.")
             if not self.slack_bot_token.startswith("xoxb-"):
                 LOG.warning("ZK_SLACK_BOT_TOKEN does not start with 'xoxb-' — "
@@ -1378,6 +1378,15 @@ class SlackError(Exception):
 
 # Slack errors that mean "this person cannot be messaged, ever" as opposed to
 # "try again". Retrying these just burns rate limit and fills the log.
+_SLACK_HINTS = {
+    "missing_scope": " — the app needs the chat:write bot scope, and scope "
+                     "changes only take effect after reinstalling it",
+    "not_in_channel": " — chat.postMessage was given a channel, not a user ID",
+    "channel_not_found": " — check the slack id in directory.json is a member "
+                         "ID (U…), copied from Profile -> More -> Copy member ID",
+    "invalid_auth": " — the bot token is wrong or has been revoked",
+}
+
 _SLACK_FATAL = {
     "user_not_found", "users_not_found", "user_disabled", "account_inactive",
     "cannot_dm_bot", "is_bot", "channel_not_found", "not_in_channel",
@@ -1388,13 +1397,18 @@ _SLACK_FATAL = {
 
 class SlackClient:
     """
-    Sends a direct message: `conversations.open` to get the DM channel for a
-    person, then `chat.postMessage` into it.
+    Sends a direct message with `chat.postMessage`.
+
+    No `conversations.open` first: chat.postMessage takes a user ID as its
+    `channel` and opens the DM itself if one is not already open. That drops
+    the `im:write` scope — the app needs only `chat:write` — and with it a
+    round trip and a channel cache. Fewer permissions into someone's
+    workspace for strictly less code.
 
     Slack signals failure with HTTP 200 and `{"ok": false, "error": "..."}`,
-    so the status code alone tells you nothing — every response is inspected.
-    A 429 carries `Retry-After`, which is honoured once; a greeting is not
-    worth holding the device's request thread open longer than that.
+    so the status code alone tells you nothing; every response is inspected.
+    A 429 carries `Retry-After`, honoured once — a greeting is not worth
+    holding the device's request thread open longer than that.
     """
 
     BASE = os.environ.get("ZK_SLACK_API_URL",
@@ -1403,8 +1417,6 @@ class SlackClient:
     def __init__(self, cfg):
         self.token = cfg.slack_bot_token
         self.timeout = cfg.slack_timeout
-        self._dm_channels = {}          # slack user id -> channel id
-        self._lock = threading.Lock()
 
     def _post(self, method, payload):
         req = urllib.request.Request(
@@ -1432,27 +1444,13 @@ class SlackClient:
             raise SlackError(f"{method}: response was not JSON")
         if not body.get("ok"):
             err = str(body.get("error", "unknown"))
-            raise SlackError(f"{method}: {err}", permanent=err in _SLACK_FATAL)
+            hint = _SLACK_HINTS.get(err, "")
+            raise SlackError(f"{method}: {err}{hint}",
+                             permanent=err in _SLACK_FATAL)
         return body
 
-    def dm_channel(self, slack_id):
-        """The DM channel for a person, cached — it never changes."""
-        with self._lock:
-            cached = self._dm_channels.get(slack_id)
-        if cached:
-            return cached
-        body = self._post("conversations.open", {"users": slack_id})
-        channel = (body.get("channel") or {}).get("id")
-        if not channel:
-            raise SlackError("conversations.open returned no channel",
-                             permanent=True)
-        with self._lock:
-            self._dm_channels[slack_id] = channel
-        return channel
-
     def send_dm(self, slack_id, text, blocks=None):
-        channel = self.dm_channel(slack_id)
-        payload = {"channel": channel, "text": text}
+        payload = {"channel": slack_id, "text": text}
         if blocks:
             payload["blocks"] = blocks
         try:

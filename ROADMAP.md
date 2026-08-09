@@ -290,9 +290,11 @@ single face match, which is why the cooldown below is not optional.
   failure rather than sending nothing.
 
 ### Phase 7 — Slack pending work
-- [~] **M7.1** Slack app needs `chat:write` and `im:write` for the DM; the
-  `users:read*` scopes are only needed if we ever resolve emails to IDs, which
-  the hand-maintained directory avoids for now.
+- [x] **M7.1** Slack app needs **only `chat:write`**. `chat.postMessage`
+  accepts a user ID as its `channel` and opens the DM itself, so
+  `conversations.open` — and the `im:write` scope it requires — is not needed.
+  The `users:read*` scopes would only matter if we resolved emails to IDs,
+  which the hand-maintained directory avoids.
 - [ ] **M7.2** **Resolve early:** `search.messages` requires a *user* token, not
   a bot token, and there is no bot-accessible "unread mentions" API. Realistic
   options are (a) a user token per person, (b) subscribe to `app_mention` /
