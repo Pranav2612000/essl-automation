@@ -77,9 +77,9 @@ silent data loss the first week.
     port can forge punches — which, once phases 5–8 land, means they can trigger
     a DM to any employee. LAN-only is a load-bearing assumption, and it belongs
     in the threat model (M10.4), not in a footnote.
-15. **Punch data is personal data.** PINs, timestamps, and movement patterns.
-    Retention, log redaction, and who can read `/punches` are policy decisions,
-    not defaults to inherit.
+15. **Punch data is personal data.** User IDs, timestamps, and movement
+    patterns. Retention, log redaction, and who can read `/punches` are policy
+    decisions, not defaults to inherit.
 
 ---
 
@@ -92,7 +92,7 @@ built and tested; `[ ]` is not started.
 - [x] **M0.1** Typed config from env with fail-fast validation and
   `--check-config`.
 - [x] **M0.2** `logging` with levels, rotating file handler, `ZK_REDACT_PINS`
-  for PIN hashing.
+  for user-ID hashing.
 - [x] **M0.3** Keep `adms.py` / `door_open.py` / `caps.py` as-is; production
   code lives in `server.py` so lab tools stay disposable.
 
@@ -118,7 +118,7 @@ built and tested; `[ ]` is not started.
 - [x] **M2.1** SQLite schema (WAL, `synchronous=FULL`): `devices`, `punches`,
   `outbox`, `uploads`; thread-local connections.
 - [x] **M2.2** Idempotent insert on `dedup_key` =
-  sha256(serial|pin|local time|status).
+  sha256(serial|user id|local time|status).
 - [x] **M2.3** Outbox rows written in the same transaction as the punch, one row
   per `(punch, sink)` — the seam every later sink plugs into.
 - [x] **M2.4** `OK: <count>` sent only after commit; storage failure returns 500
@@ -163,6 +163,19 @@ built and tested; `[ ]` is not started.
   phases 6–8 want retrieval over attendance history.
 
 ### Phase 4 — Identity directory
+
+**Naming.** The device sends this identifier as `PIN`, but it is the User ID
+shown when enrolling someone — not a secret. (A per-user password exists as a
+separate `Passwd` field, which this server never stores.) `PIN` is therefore
+kept only in the ATTLOG/USERINFO parser and the comments describing the wire
+format; everything above that layer says `user_id`: the SQLite columns, the
+`/users` and `/punches` output, the directory file keys, and the Infino column
+`employee_user_id`. Done before the Infino table had real rows and before the
+directory file was written, when it was still free. `ZK_REDACT_PINS` keeps its
+name so existing configs are not broken. Dedup keys hash the *value*, so
+renaming changed no `event_id`; older databases are migrated in place on
+startup.
+
 - [x] **M4.0** One-off device roster sync. `/users/sync` queues
   `DATA QUERY USERINFO` at the terminal; `USER` records are harvested from
   whatever upload the reply arrives on (firmware disagrees on the table), kept
@@ -171,29 +184,40 @@ built and tested; `[ ]` is not started.
   sync stays unknown until it is run again. Biometric templates and `Passwd`
   are stripped before anything is logged or stored; only the fact that a
   password is set is kept.
-- [ ] **M4.1** `directory.json` (gitignored): `pin → {name, slack, github}`,
-  built by hand from the M4.0 dump. Supersedes the YAML sketch below.
-- [ ] **M4.1a** `directory.yaml` (gitignored): `pin → {name, email, github_login,
-  slack_user_id, timezone, active, greetings_enabled}`.
-- [ ] **M4.2** Loader behind a `Directory` interface — not inline file reads —
-  so M4.5 is a swap. Validate on load; reload on SIGHUP.
-- [ ] **M4.3** Unknown PIN handling: record the punch, skip the greeting, count
-  and alert. A new hire must never crash the server or lose attendance.
+- [x] **M4.1** `directory.json` (gitignored): `user_id → {name, slack, github}`,
+  built by hand from the M4.0 dump, at `ZK_DIRECTORY_FILE`. Accepts either a
+  user-ID-keyed object or a list; `_`-prefixed keys are notes, since JSON has
+  no comments. `directory.example.json` is the template. Supersedes the YAML
+  sketch below — the extra fields there are added when something needs them.
+- [ ] **M4.1a** `directory.yaml` (gitignored): `user_id → {name, email,
+  github_login, slack_user_id, timezone, active, greetings_enabled}`.
+- [x] **M4.2** Loader behind a `Directory` interface — not inline file reads —
+  so M4.5 is a swap. Validated at startup, so `--check-config` catches a bad
+  file; errors name the offending user ID. Reload on SIGHUP is **not** done: a
+  restart is currently the way to pick up an edit.
+- [x] **M4.3** Unknown user-ID handling: the punch is recorded exactly as before
+  and a warning names the file to add the person to. Counting and alerting on
+  the rate is still open.
 - [ ] **M4.4** PII policy: what goes in logs, what is hashed, who can call
   `/punches`.
 - [ ] **M4.5** Move the directory to Infino cloud behind the same interface.
 
 ### Phase 5 — First-punch-of-day trigger
+An arrival line already prints on every new check-in
+(`"<name> entered office. slack: … github: …"`), which is the shape the DM
+will take. What phase 5 adds is *when*: once per person per day rather than on
+every check-in, and off the request path.
+
 - [ ] **M5.1** Define it precisely: `status == check_in`, first row for
-  `(pin, local_date)`, plus a cooldown so a double-tap at the reader doesn't
-  double-fire.
-- [ ] **M5.2** `greetings` table keyed `(pin, local_date)` — the idempotency
+  `(user_id, local_date)`, plus a cooldown so a double-tap at the reader
+  doesn't double-fire.
+- [ ] **M5.2** `greetings` table keyed `(user_id, local_date)` — the idempotency
   guard that makes restarts and device re-uploads safe.
 - [ ] **M5.3** Suppression rules: quiet hours, weekends, a holiday list, and
   `greetings_enabled=false`.
 - [ ] **M5.4** Register a `greeting` sink so trigger evaluation runs on the
   worker, off the device's request path.
-- [ ] **M5.5** `/greet?pin=…&dry_run=1` to render a message without sending —
+- [ ] **M5.5** `/greet?user_id=…&dry_run=1` to render a message without sending —
   the thing you will actually use while building phases 6–8.
 
 ### Phase 6 — GitHub pending work

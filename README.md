@@ -61,7 +61,7 @@ of re-uploading whole batches harmless — and, since Infino has no idempotency
 mechanism, it is also how readers should dedup:
 
 ```sql
-SELECT employee_pin, punched_at_local, direction
+SELECT employee_user_id, punched_at_local, direction
   FROM attendance
  WHERE local_date = '2026-08-08' AND direction = 'check_in'
 ```
@@ -73,6 +73,8 @@ Operator endpoints (`?token=` or an `X-Auth-Token` header):
 | `/healthz` | Liveness. No token, no personal data. 503 when the device has gone quiet or deliveries are dead-lettered. |
 | `/status` | Devices, queue depth, delivery counters |
 | `/punches?limit=20` | Most recent stored punches |
+| `/users/sync` | Ask the terminal to upload its user table (run by hand) |
+| `/users` | Read back that user table |
 | `/open?door=1&sec=5` | Momentary unlock |
 | `/hold` / `/release` | Latch the door open / re-lock it |
 | `/raw?p=…`, `/reboot` | Only with `ZK_DEBUG_ENDPOINTS=1` |
@@ -80,6 +82,29 @@ Operator endpoints (`?token=` or an `X-Auth-Token` header):
 All settings are documented in `.env.example`. The discovery endpoints
 (`/caps`, `/setopt`, `/sweep`, …) are deliberately absent — that work belongs in
 `caps.py`.
+
+### Who just walked in
+
+The terminal only knows a user ID. To turn that into a person, point
+`ZK_DIRECTORY_FILE` at a JSON file mapping each user ID to a name and the
+accounts the device cannot know:
+
+```json
+{"7": {"name": "Asha Rao", "slack": "U0123ABCDEF", "github": "asharao"}}
+```
+
+Build it once from the device itself — `/users/sync`, wait a poll, then
+`/users` — and fill in the handles by hand. `directory.example.json` is the
+template; copy it to `directory.json`, which is gitignored because it is a
+staff list. A check-in then logs:
+
+```
+Asha Rao entered office. slack: U0123ABCDEF github: asharao
+```
+
+An unknown user ID logs a warning naming the file to add them to, and never
+interferes with recording the punch. A malformed file stops startup, so
+`--check-config` catches a typo rather than a Monday morning does.
 
 ## Setup
 
@@ -181,6 +206,7 @@ environment's). The variables shared with the exploratory scripts:
 | --- | --- | --- |
 | `ZK_AUTH_TOKEN` | push servers | Shared secret for control endpoints. Required. |
 | `ZK_DEVICE_TZ` | `server.py` | IANA zone the device's clock is set to. Required. |
+| `ZK_DIRECTORY_FILE` | `server.py` | JSON mapping PIN → name, Slack ID, GitHub login. Optional. |
 | `ZK_PORT` | push servers | Listen port (default `8081`; a CLI argument overrides it). |
 | `ZK_BIND` | push servers | Bind address (default `0.0.0.0`, since the device dials in). |
 | `ZK_DEVICE_IP` | `pull_test.py` | Device address. |

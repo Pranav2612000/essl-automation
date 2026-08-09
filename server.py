@@ -43,6 +43,10 @@ Settings can come from a file instead of the environment:
     python3 server.py --dev               # load ./dev.env (dry run, no cloud)
     python3 server.py --env-file prod.env # any file; repeatable, later wins
 
+Point ZK_DIRECTORY_FILE at a JSON file of user ID -> {name, slack, github} and a
+check-in logs who walked in. See directory.example.json; build it from the
+device's own roster with /users/sync then /users.
+
 Real environment variables override the file (use --override-env to invert
 that), and a positional port argument overrides both.
 
@@ -263,6 +267,7 @@ class Config:
     auth_token: str
     device_tz: str
     db_path: str
+    directory_file: str
     log_level: str
     log_file: str
     redact_pins: bool
@@ -314,6 +319,7 @@ class Config:
             # what instant a punch refers to, so there is no safe default.
             device_tz=os.environ.get("ZK_DEVICE_TZ", ""),
             db_path=os.environ.get("ZK_DB_PATH", "data/attendance.db"),
+            directory_file=os.environ.get("ZK_DIRECTORY_FILE", "").strip(),
             log_level=os.environ.get("ZK_LOG_LEVEL", "INFO").upper(),
             log_file=os.environ.get("ZK_LOG_FILE", ""),
             redact_pins=_env_bool("ZK_REDACT_PINS", False),
@@ -364,6 +370,10 @@ class Config:
         elif len(self.auth_token) < 16:
             raise ConfigError("ZK_AUTH_TOKEN is shorter than 16 characters; "
                               "generate one with secrets.token_urlsafe(24)")
+        if not self.directory_file:
+            LOG.warning("ZK_DIRECTORY_FILE is not set — an arrival will be "
+                        "logged by user ID only, with no name, Slack or GitHub. "
+                        "Copy directory.example.json and point at it.")
         unknown = set(self.sinks) - {"log", "infino"}
         if unknown:
             raise ConfigError(f"ZK_SINKS contains unknown sink(s): "
@@ -447,7 +457,10 @@ def _iso(dt):
 @dataclass(frozen=True)
 class Punch:
     serial: str
-    pin: str
+    # The device's User ID for the person — what the terminal calls PIN on the
+    # wire and shows as "User ID" when enrolling. Not a secret: the password is
+    # a separate field we deliberately never keep.
+    user_id: str
     punched_local: str          # exactly what the device sent
     punched_utc: str            # "" when the timestamp was unparseable
     local_date: str             # device-local calendar day, for daily triggers
@@ -463,11 +476,12 @@ class Punch:
         Stable identity for one physical punch.
 
         The device re-sends batches it thinks failed, so the same record can
-        arrive many times. Serial + PIN + device-local timestamp + status is
-        the natural key: a person cannot produce two distinct punches of the
+        arrive many times. Serial + user ID + device-local timestamp + status
+        is the natural key: a person cannot produce two distinct punches of the
         same type at the same second on the same terminal.
         """
-        material = f"{self.serial}|{self.pin}|{self.punched_local}|{self.status}"
+        material = (f"{self.serial}|{self.user_id}|{self.punched_local}"
+                    f"|{self.status}")
         return hashlib.sha256(material.encode()).hexdigest()[:32]
 
     @property
@@ -486,7 +500,7 @@ class Punch:
             "schema_version": PAYLOAD_SCHEMA,
             "event_id": self.dedup_key,
             "device_serial": self.serial,
-            "employee_pin": self.pin,
+            "employee_user_id": self.user_id,
             "punched_at": self.punched_utc or None,
             "punched_at_local": self.punched_local,
             "local_date": self.local_date,
@@ -508,7 +522,8 @@ def parse_attlog_line(line, serial, tz, received_utc):
 
     Canonical form is tab-separated:
         PIN <TAB> YYYY-MM-DD HH:MM:SS <TAB> status <TAB> verify <TAB> workcode
-    with trailing reserved columns we ignore.
+    with trailing reserved columns we ignore. `PIN` is the wire name for what
+    the device calls a User ID, and is carried as `user_id` from here on.
     """
     line = line.rstrip("\r\n")
     if not line.strip():
@@ -554,7 +569,7 @@ def parse_attlog_line(line, serial, tz, received_utc):
 
     return Punch(
         serial=serial,
-        pin=pin,
+        user_id=pin,
         punched_local=ts.replace("T", " "),
         punched_utc=punched_utc,
         local_date=local_date,
@@ -621,6 +636,131 @@ def scrub_secrets(text):
 
 
 # --------------------------------------------------------------------------
+# Identity directory
+# --------------------------------------------------------------------------
+
+# Field aliases accepted in the directory file. The canonical names are the
+# short ones; the rest are what people actually type.
+_SLACK_KEYS = ("slack", "slack_id", "slack_user_id", "slack_handle")
+_GITHUB_KEYS = ("github", "github_login", "github_username", "github_handle")
+
+
+@dataclass(frozen=True)
+class Person:
+    user_id: str
+    name: str
+    slack: str          # "" when not known — a person may have no account
+    github: str
+
+
+def _first_value(body, keys):
+    for key in keys:
+        value = body.get(key)
+        if isinstance(value, (str, int)) and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+class Directory:
+    """
+    User ID -> person, read from a JSON file maintained by hand.
+
+    The file is built from the /users dump: the terminal knows a User ID and a
+    name, and this adds the Slack and GitHub handles it cannot know. A plain
+    file is the right home for it — it is edited by a human, reviewed in a
+    diff, and small. ROADMAP M4.5 moves it to Infino behind this same
+    interface, which is why callers only ever see `get()`.
+
+    Two shapes are accepted, because both are natural to write:
+
+        {"7": {"name": "Asha Rao", "slack": "U0123ABC", "github": "asha"}}
+        [{"user_id": "7", "name": "Asha Rao", "slack": "U0123ABC", ...}]
+
+    Errors name the offending entry. A typo in a fifty-person file is only
+    findable if the message says which line to look at.
+    """
+
+    def __init__(self, path=""):
+        self.path = path
+        self._people = {}
+
+    def __len__(self):
+        return len(self._people)
+
+    def get(self, user_id):
+        return self._people.get(str(user_id).strip())
+
+    def load(self):
+        """
+        Read and validate the file, replacing what is held. Raises ConfigError
+        so a bad file fails at startup — and under --check-config — rather
+        than at 9am on the first punch of the day.
+
+        The parse builds a whole new dict before publishing it, so a failed
+        reload leaves the previous contents intact.
+        """
+        if not self.path:
+            self._people = {}
+            return self
+        try:
+            with open(self.path, "r", encoding="utf-8-sig") as fh:
+                raw = json.load(fh)
+        except OSError as e:
+            raise ConfigError(
+                f"cannot read ZK_DIRECTORY_FILE {self.path}: {e.strerror}")
+        except ValueError as e:
+            raise ConfigError(f"{self.path} is not valid JSON: {e}")
+
+        if isinstance(raw, dict):
+            # JSON has no comment syntax, and this file is maintained by hand
+            # by whoever owns the mapping. An "_"-prefixed key is a note to
+            # them, not a person.
+            entries = [(str(uid), body) for uid, body in raw.items()
+                       if not str(uid).startswith("_")]
+        elif isinstance(raw, list):
+            entries = [(None, body) for body in raw]
+        else:
+            raise ConfigError(
+                f"{self.path}: expected a JSON object keyed by user ID, or a "
+                f"list of entries, but the file holds a {type(raw).__name__}")
+
+        people = {}
+        for i, (user_id, body) in enumerate(entries, 1):
+            where = (f"{self.path}: user ID {user_id}" if user_id
+                     else f"{self.path}: entry {i}")
+            if not isinstance(body, dict):
+                raise ConfigError(f"{where}: expected an object with name, "
+                                  f"slack and github, got a "
+                                  f"{type(body).__name__}")
+            # "pin" is the terminal's wire name for this value, so it is an
+            # easy thing to type here. Say so rather than reporting a missing
+            # user_id and leaving the author to guess which name won.
+            if not user_id and "pin" in body and "user_id" not in body:
+                raise ConfigError(
+                    f'{where}: use "user_id", not "pin". The device sends it '
+                    f'as PIN on the wire, but it is the User ID shown when '
+                    f'enrolling — this file uses that name throughout.')
+            user_id = (user_id or str(body.get("user_id", ""))).strip()
+            if not user_id:
+                raise ConfigError(f"{where}: no user ID. Either key each entry "
+                                  f'by the device user ID, or give it a '
+                                  f'"user_id" field.')
+            if user_id in people:
+                raise ConfigError(
+                    f"{self.path}: user ID {user_id} appears twice")
+            name = str(body.get("name", "")).strip()
+            if not name:
+                raise ConfigError(f"{self.path}: user ID {user_id} has no "
+                                  f"name. Copy it from /users so the greeting "
+                                  f"can address someone.")
+            people[user_id] = Person(user_id=user_id, name=name,
+                                     slack=_first_value(body, _SLACK_KEYS),
+                                     github=_first_value(body, _GITHUB_KEYS))
+        self._people = people
+        return self
+
+
+# --------------------------------------------------------------------------
 # Storage
 # --------------------------------------------------------------------------
 
@@ -637,7 +777,7 @@ CREATE TABLE IF NOT EXISTS punches (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     dedup_key       TEXT NOT NULL UNIQUE,
     serial          TEXT NOT NULL,
-    pin             TEXT NOT NULL,
+    user_id         TEXT NOT NULL,
     punched_local   TEXT NOT NULL,
     punched_utc     TEXT,
     local_date      TEXT,
@@ -648,7 +788,7 @@ CREATE TABLE IF NOT EXISTS punches (
     received_utc    TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS punches_person_day
-    ON punches (pin, local_date);
+    ON punches (user_id, local_date);
 
 -- One row per (punch, sink). Adding a sink later (e.g. the good-morning
 -- greeter) means writing an extra row here, not changing the device path.
@@ -678,7 +818,7 @@ CREATE INDEX IF NOT EXISTS outbox_ready
 -- whether one is set is recorded.
 CREATE TABLE IF NOT EXISTS device_users (
     serial          TEXT NOT NULL,
-    pin             TEXT NOT NULL,
+    user_id         TEXT NOT NULL,
     name            TEXT,
     privilege       INTEGER,
     card            TEXT,
@@ -688,7 +828,7 @@ CREATE TABLE IF NOT EXISTS device_users (
     raw             TEXT,
     first_seen_utc  TEXT NOT NULL,
     last_seen_utc   TEXT NOT NULL,
-    PRIMARY KEY (serial, pin)
+    PRIMARY KEY (serial, user_id)
 );
 
 -- Non-attendance uploads (OPERLOG door events, options replies, ...). Kept
@@ -717,9 +857,29 @@ class Store:
         conn = self._connect()
         try:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
             conn.commit()
         finally:
             conn.close()
+
+    @staticmethod
+    def _migrate(conn):
+        """
+        Bring an older database up to the current column names.
+
+        `pin` became `user_id` once it was clear the device sends a User ID and
+        not a secret. The stored values never changed, so renaming in place is
+        right — recreating the table would cost a day of attendance to fix a
+        label. Runs after the schema script, which is a no-op for a table that
+        already exists; SQLite carries indexes across a column rename.
+        """
+        for table in ("punches", "device_users"):
+            cols = {r["name"] for r in
+                    conn.execute(f"PRAGMA table_info({table})")}
+            if "pin" in cols and "user_id" not in cols:
+                conn.execute(
+                    f"ALTER TABLE {table} RENAME COLUMN pin TO user_id")
+                LOG.info("migrated %s.pin to %s.user_id", table, table)
 
     def _connect(self):
         conn = sqlite3.connect(self.path, timeout=10.0)
@@ -765,10 +925,11 @@ class Store:
         with self.conn as conn:
             cur = conn.execute(
                 """INSERT OR IGNORE INTO punches
-                       (dedup_key, serial, pin, punched_local, punched_utc,
+                       (dedup_key, serial, user_id, punched_local, punched_utc,
                         local_date, status, verify, workcode, raw, received_utc)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (punch.dedup_key, punch.serial, punch.pin, punch.punched_local,
+                (punch.dedup_key, punch.serial, punch.user_id,
+                 punch.punched_local,
                  punch.punched_utc or None, punch.local_date or None,
                  punch.status, punch.verify, punch.workcode, punch.raw,
                  punch.received_utc))
@@ -809,11 +970,11 @@ class Store:
         with self.conn as conn:
             conn.execute(
                 """INSERT INTO device_users
-                       (serial, pin, name, privilege, card, group_id,
+                       (serial, user_id, name, privilege, card, group_id,
                         timezones, has_password, raw, first_seen_utc,
                         last_seen_utc)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
-                   ON CONFLICT(serial, pin) DO UPDATE SET
+                   ON CONFLICT(serial, user_id) DO UPDATE SET
                        name         = COALESCE(excluded.name, name),
                        privilege    = COALESCE(excluded.privilege, privilege),
                        card         = COALESCE(excluded.card, card),
@@ -888,19 +1049,20 @@ class Store:
 
     def recent_punches(self, limit=20):
         return self.conn.execute(
-            """SELECT pin, punched_local, punched_utc, status, verify, serial
+            """SELECT user_id, punched_local, punched_utc, status, verify,
+                      serial
                  FROM punches ORDER BY id DESC LIMIT ?""",
             (max(1, min(500, limit)),)).fetchall()
 
     def device_users(self, serial=None):
-        """The roster, ordered by PIN numerically where the PIN is a number."""
+        """The roster, ordered by user ID numerically where it is a number."""
         where = "WHERE serial = ?" if serial else ""
         params = (serial,) if serial else ()
         return self.conn.execute(f"""
-            SELECT serial, pin, name, privilege, card, group_id, timezones,
+            SELECT serial, user_id, name, privilege, card, group_id, timezones,
                    has_password, first_seen_utc, last_seen_utc
               FROM device_users {where}
-             ORDER BY CAST(pin AS INTEGER), pin
+             ORDER BY CAST(user_id AS INTEGER), user_id
         """, params).fetchall()
 
 
@@ -920,14 +1082,14 @@ class DeliveryResult:
 # which must produce exactly these column names.
 #
 # No fts or vector index is declared: every question we ask of this table
-# ("what did PIN 12 do today?") is a SQL predicate, which /v1/query_sql answers
+# ("what did user 12 do today?") is a SQL predicate, which /v1/query_sql answers
 # without one. Adding a full-text or embedding index later is a deliberate
 # schema change, not something to guess at now.
 INFINO_TABLE_SCHEMA = [
     {"name": "event_id", "type": "large_utf8", "nullable": False},
     {"name": "schema_version", "type": "large_utf8"},
     {"name": "device_serial", "type": "large_utf8"},
-    {"name": "employee_pin", "type": "large_utf8"},
+    {"name": "employee_user_id", "type": "large_utf8"},
     {"name": "punched_at", "type": "large_utf8"},
     {"name": "punched_at_local", "type": "large_utf8"},
     {"name": "local_date", "type": "large_utf8"},
@@ -1347,6 +1509,7 @@ class Handler(BaseHTTPRequestHandler):
     queue = None
     registry = None
     worker = None
+    directory = None
     started_at = time.monotonic()
 
     protocol_version = "HTTP/1.0"    # terminals don't benefit from keep-alive
@@ -1400,10 +1563,12 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         return raw.decode("utf-8", errors="replace")
 
-    def _pin_for_log(self, pin):
+    def _user_id_for_log(self, user_id):
+        """Hash the user ID when ZK_REDACT_PINS is on. The variable keeps its
+        name for compatibility; what it redacts is the User ID."""
         if not self.cfg.redact_pins:
-            return pin
-        return "pin:" + hashlib.sha256(pin.encode()).hexdigest()[:8]
+            return user_id
+        return "user:" + hashlib.sha256(user_id.encode()).hexdigest()[:8]
 
     def _serial(self, q):
         """Extract and screen the device serial from the query string."""
@@ -1502,9 +1667,10 @@ class Handler(BaseHTTPRequestHandler):
             if is_new:
                 new += 1
                 LOG.info("PUNCH %s %s %s (%s via %s)",
-                         self._pin_for_log(punch.pin), punch.punched_local,
+                         self._user_id_for_log(punch.user_id), punch.punched_local,
                          punch.punched_utc or "?", punch.direction,
                          VERIFY_METHOD.get(punch.verify, punch.verify))
+                self._announce_arrival(punch)
             else:
                 LOG.debug("duplicate punch ignored: %s", punch.dedup_key[:12])
 
@@ -1514,6 +1680,36 @@ class Handler(BaseHTTPRequestHandler):
         # cannot parse will not make it parseable, and stalling the device on it
         # would block every later punch behind it.
         self._reply(f"OK: {accepted + malformed}")
+
+    # ---- arrivals ------------------------------------------------------
+    def _announce_arrival(self, punch):
+        """
+        Say who just walked in. Called once per *new* punch, so a device
+        re-uploading a batch cannot repeat the line.
+
+        Only check-ins are announced — "entered office" is false for a
+        check-out. Most eSSL terminals report every punch as a check-in unless
+        someone presses a mode key, so in practice this fires on all of them;
+        the DEBUG line below is what to look at if it unexpectedly does not.
+
+        This is not yet the once-a-day greeting: a second check-in after lunch
+        announces again. First-punch-of-day and its idempotency guard are
+        ROADMAP M5.1 and M5.2.
+        """
+        if punch.direction != "check_in":
+            LOG.debug("no arrival line for %s: direction is %s",
+                      self._user_id_for_log(punch.user_id), punch.direction)
+            return
+        if self.cfg.redact_pins:
+            return
+        person = self.directory.get(punch.user_id)
+        if person is None:
+            LOG.warning("user %s entered office, but is not in %s — add them "
+                        "to see their name, Slack and GitHub", punch.user_id,
+                        self.cfg.directory_file or "any directory file")
+            return
+        LOG.info("%s entered office. slack: %s github: %s", person.name,
+                 person.slack or "-", person.github or "-")
 
     # ---- user roster ---------------------------------------------------
     def _harvest_users(self, serial, body):
@@ -1546,7 +1742,7 @@ class Handler(BaseHTTPRequestHandler):
         redact = self.cfg.redact_pins
         return {
             "serial": row["serial"],
-            "pin": self._pin_for_log(row["pin"]),
+            "user_id": self._user_id_for_log(row["user_id"]),
             "name": "<redacted>" if redact else row["name"],
             "privilege": PRIVILEGE.get(row["privilege"],
                                        f"unknown_{row['privilege']}"),
@@ -1566,8 +1762,9 @@ class Handler(BaseHTTPRequestHandler):
         if not people:
             LOG.info("  (nothing harvested yet — call /users/sync)")
         for p in people:
-            LOG.info("  PIN %-6s %-28s %-11s card=%-10s group=%s",
-                     p["pin"], (p["name"] or "(unnamed)")[:28], p["privilege"],
+            LOG.info("  user %-6s %-28s %-11s card=%-10s group=%s",
+                     p["user_id"], (p["name"] or "(unnamed)")[:28],
+                     p["privilege"],
                      p["card"] or "-", p["group"] or "-")
         LOG.info("=" * 68)
 
@@ -1655,7 +1852,7 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return self._reply("limit must be an integer\n", 400)
             return self._reply_json([
-                {"pin": self._pin_for_log(r["pin"]),
+                {"user_id": self._user_id_for_log(r["user_id"]),
                  "punched_local": r["punched_local"],
                  "punched_utc": r["punched_utc"],
                  "direction": PUNCH_STATUS.get(r["status"], r["status"]),
@@ -1814,7 +2011,7 @@ def _lan_ip():
         s.close()
 
 
-def _banner(cfg):
+def _banner(cfg, directory):
     ip = _lan_ip()
     LOG.info("=" * 68)
     LOG.info(" eSSL / ZKTeco attendance push server")
@@ -1823,6 +2020,8 @@ def _banner(cfg):
              cfg.bind)
     LOG.info(" device config  Address=%s  Port=%s  Mode=ADMS", ip, cfg.port)
     LOG.info(" database       %s", os.path.abspath(cfg.db_path))
+    LOG.info(" directory      %s", f"{cfg.directory_file} ({len(directory)} "
+             f"person/people)" if cfg.directory_file else "not set")
     LOG.info(" device tz      %s", cfg.device_tz)
     LOG.info(" sinks          %s", ", ".join(cfg.sinks))
     if "infino" in cfg.sinks:
@@ -1879,9 +2078,16 @@ def main(argv=None):
             LOG.info("config file %s: %d setting(s) applied", path, len(names))
         cfg = Config.from_env(args.port)
         setup_logging(cfg)
+        # Loaded here rather than lazily so a malformed file is a startup
+        # failure that --check-config catches, not a surprise on a Monday.
+        directory = Directory(cfg.directory_file).load()
     except ConfigError as e:
         print(f"configuration error: {e}", file=sys.stderr)
         return 2
+
+    if cfg.directory_file:
+        LOG.info("directory %s: %d person/people loaded",
+                 cfg.directory_file, len(directory))
 
     if args.check_config:
         LOG.info("configuration OK")
@@ -1903,6 +2109,7 @@ def main(argv=None):
     Handler.queue = CommandQueue()
     Handler.registry = DeviceRegistry()
     Handler.worker = worker
+    Handler.directory = directory
     Handler.started_at = time.monotonic()
 
     try:
@@ -1921,7 +2128,7 @@ def main(argv=None):
     signal.signal(signal.SIGINT, _shutdown)
 
     worker.start()
-    _banner(cfg)
+    _banner(cfg, directory)
     try:
         httpd.serve_forever(poll_interval=0.5)
     finally:

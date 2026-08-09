@@ -1,0 +1,48 @@
+{
+  "_comment": [
+    "Identity mapping: device user ID -> the person, and the accounts the",
+    "terminal cannot know. Copy this to directory.json (gitignored), replace",
+    "the sample rows, and point ZK_DIRECTORY_FILE at it.",
+    "",
+    "The keys are User IDs — what the terminal shows as 'User ID' when you",
+    "enrol someone. The push protocol calls the same value PIN on the wire,",
+    "which is why the server's parser still uses that word; it is an identity",
+    "number, not a password. (The device does have a per-user password, and",
+    "this server deliberately never stores it.)",
+    "",
+    "Build the file from the device's own roster:",
+    "    python3 server.py --dev",
+    "    curl 'http://127.0.0.1:8081/users/sync?token=$ZK_AUTH_TOKEN'",
+    "    # wait a poll or two for the terminal to answer",
+    "    curl 'http://127.0.0.1:8081/users?token=$ZK_AUTH_TOKEN'",
+    "That gives you the user_id and name of everyone enrolled; add slack and",
+    "github by hand. Keys must match the user ID exactly as the device",
+    "reports it.",
+    "",
+    "slack is the Slack *user ID* (U0123ABCDEF), not the @handle: IDs survive a",
+    "display-name change and are what chat.postMessage wants later. Find one in",
+    "Slack under Profile -> More -> Copy member ID.",
+    "",
+    "name is required. slack and github may be omitted or left empty for",
+    "someone who has no account; they print as '-'.",
+    "",
+    "Keys starting with _ are skipped by the loader, so this block is safe to",
+    "keep as a note to whoever edits the file next."
+  ],
+
+  "1": {
+    "name": "Asha Rao",
+    "slack": "U0123ABCDEF",
+    "github": "asharao"
+  },
+  "2": {
+    "name": "Ravi Kulkarni",
+    "slack": "U0456GHIJKL",
+    "github": "rk-dev"
+  },
+  "3": {
+    "name": "Meera Shah",
+    "slack": "U0789MNOPQR",
+    "github": ""
+  }
+}
