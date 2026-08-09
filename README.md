@@ -93,7 +93,8 @@ Operator endpoints (`?token=` or an `X-Auth-Token` header):
 | --- | --- |
 | `/healthz` | Liveness. No token, no personal data. 503 when the device has gone quiet or deliveries are dead-lettered. |
 | `/status` | Devices, queue depth, delivery counters |
-| `/punches?limit=20` | Most recent stored punches |
+| `/punches?limit=20` | Most recent stored punches — a quick look, no filters |
+| `/attendance` | Attendance as JSON, filtered and paged — see below |
 | `/users/sync` | Ask the terminal to upload its user table (run by hand) |
 | `/users` | Read back that user table |
 | `/open?door=1&sec=5` | Momentary unlock |
@@ -103,6 +104,48 @@ Operator endpoints (`?token=` or an `X-Auth-Token` header):
 All settings are documented in `.env.example`. The discovery endpoints
 (`/caps`, `/setopt`, `/sweep`, …) are deliberately absent — that work belongs in
 `caps.py`.
+
+### Reading attendance back
+
+```bash
+curl "http://<ip>:8081/attendance?token=$ZK_AUTH_TOKEN&date=2026-08-09"
+curl "…/attendance?token=…&user_id=3&from=2026-08-01&to=2026-08-09&order=asc"
+curl "…/attendance?token=…&limit=500&offset=500"
+```
+
+| Parameter | Meaning |
+| --- | --- |
+| `date=YYYY-MM-DD` | One device-local day. Mutually exclusive with `from`/`to`. |
+| `from=` / `to=` | Inclusive device-local date range |
+| `user_id=` | One person |
+| `sn=` | One terminal |
+| `limit=` / `offset=` | Page size (1–1000, default 100) and offset |
+| `order=asc\|desc` | Oldest or newest first (default `desc`) |
+
+```json
+{
+  "filters": {"user_id": "3", "from": "2026-08-01", "to": "2026-08-09", "order": "asc"},
+  "total": 12, "returned": 12, "limit": 100, "offset": 0, "has_more": false,
+  "punches": [{
+    "event_id": "c20f30418f563eb8129d9cf6c23c701b",
+    "user_id": "3", "name": "Pranav", "serial": "NYU7261200921",
+    "punched_local": "2026-08-09 16:49:19", "punched_utc": "2026-08-09T11:19:19Z",
+    "local_date": "2026-08-09", "direction": "unspecified", "status_code": 255,
+    "verify_method": "fingerprint", "workcode": "0",
+    "received_utc": "2026-08-09T11:19:21Z"
+  }]
+}
+```
+
+`total` is the full count matching the filter, `returned` is this page.
+`event_id` is the same id the Infino rows carry, so these join to both cloud
+tables. Reads come from SQLite, not Infino: it is the source of truth that
+feeds the cloud, it is complete even while the outbox is draining, and it
+needs no network.
+
+`name` is resolved from the directory **as it stands now**, so a renamed
+person reads back under their current name — the opposite of the `arrivals`
+rows, which deliberately freeze identity at the moment someone walked in.
 
 ### Who just walked in
 

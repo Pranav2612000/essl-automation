@@ -66,7 +66,10 @@ Device (unauthenticated — a terminal cannot present a token):
 Operator (require $ZK_AUTH_TOKEN as ?token= or an X-Auth-Token header):
     /healthz             liveness, no token, no data
     /status              devices, outbox depth, queued commands
-    /punches?limit=20    most recent stored punches
+    /punches?limit=20    most recent stored punches (quick look)
+    /attendance          attendance as JSON, filtered:
+                         ?date= | ?from=&to=  ?user_id=  ?sn=
+                         ?limit=&offset=  ?order=asc|desc
     /users/sync          ask the device to upload its user table (one-off)
     /users               read back the user table it sent
     /open?door=1&sec=5   momentary unlock
@@ -1263,6 +1266,51 @@ class Store:
                  FROM punches ORDER BY id DESC LIMIT ?""",
             (max(1, min(500, limit)),)).fetchall()
 
+    def attendance(self, user_id=None, serial=None, date_from=None,
+                   date_to=None, limit=100, offset=0, newest_first=True):
+        """
+        Filtered attendance, plus the total the filter matches.
+
+        Reads SQLite rather than Infino: this is the source of truth that
+        feeds the cloud, it is complete even while the outbox is draining, and
+        it needs no network. Returns (rows, total, has_more).
+
+        Every filter is a bound parameter — the only thing interpolated into
+        the SQL is the sort direction, which is picked from two literals.
+
+        Rows with an unparseable device timestamp have a NULL `local_date` and
+        so fall outside any date filter. They are still returned unfiltered,
+        which is where you would go looking for them.
+        """
+        where, params = [], []
+        if user_id:
+            where.append("user_id = ?")
+            params.append(user_id)
+        if serial:
+            where.append("serial = ?")
+            params.append(serial)
+        if date_from:
+            where.append("local_date >= ?")
+            params.append(date_from)
+        if date_to:
+            where.append("local_date <= ?")
+            params.append(date_to)
+        clause = ("WHERE " + " AND ".join(where)) if where else ""
+        order = "DESC" if newest_first else "ASC"
+
+        total = self.conn.execute(
+            f"SELECT COUNT(*) AS n FROM punches {clause}",
+            params).fetchone()["n"]
+        # One more than asked for, so "is there another page?" costs nothing.
+        rows = self.conn.execute(f"""
+            SELECT dedup_key, serial, user_id, punched_local, punched_utc,
+                   local_date, status, verify, workcode, received_utc
+              FROM punches {clause}
+             ORDER BY punched_local {order}, id {order}
+             LIMIT ? OFFSET ?""",
+            (*params, limit + 1, offset)).fetchall()
+        return rows[:limit], total, len(rows) > limit
+
     def device_users(self, serial=None):
         """The roster, ordered by user ID numerically where it is a number."""
         where = "WHERE serial = ?" if serial else ""
@@ -1994,6 +2042,122 @@ class Handler(BaseHTTPRequestHandler):
                  arrival["person_name"] or f"user {arrival['employee_user_id']}",
                  arrival["slack_id"] or "-", arrival["github_id"] or "-")
 
+    # ---- attendance query ----------------------------------------------
+    def _int_param(self, q, name, default, low, high):
+        """Read a bounded integer query parameter, or None after replying 400."""
+        raw = q.get(name, [""])[0].strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            self._reply(f"{name} must be an integer, got {raw!r}\n", 400)
+            return None
+        if not low <= value <= high:
+            self._reply(f"{name} must be between {low} and {high}, "
+                        f"got {value}\n", 400)
+            return None
+        return value
+
+    def _date_param(self, q, name):
+        """Read a YYYY-MM-DD parameter. Returns (value, ok)."""
+        raw = q.get(name, [""])[0].strip()
+        if not raw:
+            return "", True
+        try:
+            datetime.date.fromisoformat(raw)
+        except ValueError:
+            self._reply(f"{name} must be a date as YYYY-MM-DD, got {raw!r}\n",
+                        400)
+            return "", False
+        return raw, True
+
+    def _attendance(self, q):
+        """
+        Attendance as JSON, filtered.
+
+            /attendance?date=2026-08-09
+            /attendance?user_id=3&from=2026-08-01&to=2026-08-09
+            /attendance?limit=500&offset=500&order=asc
+
+        `name` is resolved from the directory as it stands *now*, so a renamed
+        person reads back under their current name. That is the opposite of
+        the `arrivals` rows in Infino, which deliberately freeze identity at
+        the moment someone walked in — use those when you need to know what
+        was true then.
+        """
+        limit = self._int_param(q, "limit", 100, 1, 1000)
+        if limit is None:
+            return
+        offset = self._int_param(q, "offset", 0, 0, 10_000_000)
+        if offset is None:
+            return
+
+        # ?date= is shorthand for a single day, and cannot be combined with a
+        # range without one silently winning.
+        single, ok = self._date_param(q, "date")
+        if not ok:
+            return
+        date_from, ok = self._date_param(q, "from")
+        if not ok:
+            return
+        date_to, ok = self._date_param(q, "to")
+        if not ok:
+            return
+        if single and (date_from or date_to):
+            return self._reply("pass either date= or from=/to=, not both\n",
+                               400)
+        if single:
+            date_from = date_to = single
+        if date_from and date_to and date_from > date_to:
+            return self._reply(f"from={date_from} is after to={date_to}\n", 400)
+
+        order = q.get("order", ["desc"])[0].strip().lower() or "desc"
+        if order not in ("asc", "desc"):
+            return self._reply("order must be asc or desc\n", 400)
+
+        user_id = q.get("user_id", [""])[0].strip()
+        serial = q.get("sn", [""])[0].strip()
+        rows, total, has_more = self.store.attendance(
+            user_id=user_id or None, serial=serial or None,
+            date_from=date_from or None, date_to=date_to or None,
+            limit=limit, offset=offset, newest_first=(order == "desc"))
+
+        return self._reply_json({
+            "filters": {"user_id": user_id or None, "serial": serial or None,
+                        "from": date_from or None, "to": date_to or None,
+                        "order": order},
+            "total": total,
+            "returned": len(rows),
+            "limit": limit,
+            "offset": offset,
+            "has_more": has_more,
+            "redacted": self.cfg.redact_pins,
+            "punches": [self._attendance_json(r) for r in rows],
+        })
+
+    def _attendance_json(self, row):
+        person = self.directory.get(row["user_id"])
+        redact = self.cfg.redact_pins
+        return {
+            # The same id the Infino rows carry, so these join to both tables.
+            "event_id": row["dedup_key"],
+            "user_id": self._user_id_for_log(row["user_id"]),
+            "name": None if redact else (person.name or None) if person
+                    else None,
+            "serial": row["serial"],
+            "punched_local": row["punched_local"],
+            "punched_utc": row["punched_utc"],
+            "local_date": row["local_date"],
+            "direction": PUNCH_STATUS.get(row["status"],
+                                          f"unknown_{row['status']}"),
+            "status_code": row["status"],
+            "verify_method": VERIFY_METHOD.get(row["verify"],
+                                               f"unknown_{row['verify']}"),
+            "workcode": row["workcode"],
+            "received_utc": row["received_utc"],
+        }
+
     # ---- user roster ---------------------------------------------------
     def _harvest_users(self, serial, body):
         """
@@ -2145,6 +2309,9 @@ class Handler(BaseHTTPRequestHandler):
                  "verify": VERIFY_METHOD.get(r["verify"], r["verify"]),
                  "serial": r["serial"]}
                 for r in self.store.recent_punches(limit)])
+
+        if path == "/attendance":
+            return self._attendance(q)
 
         # The device's user list, for the one-off sync that seeds the identity
         # file. /users/sync asks the terminal for it; /users reads back what
