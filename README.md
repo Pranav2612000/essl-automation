@@ -169,10 +169,28 @@ in/out pairs: a terminal that reports no direction (every punch is status
 When someone's first punch of the day lands, they get a Slack DM:
 
 > **Good morning, Pranav!** :sunny:
+>
+> **3 pull requests are waiting on your review**
+> • [infino/platform#412](#) Fix retry storm on cold start
+>   _by asha · waiting 5 days_
+> • [infino/office-bot#87](#) Add arrivals table
+>   _by ravi · waiting 1 day_
+>
 > _You get this when you arrive at the office._
 
 No check-in time in the message. The server knows it to the second, but
 quoting it back turns a greeting into a timesheet.
+
+**The review queue** comes from `review-requested:<login>`, which is exactly
+the pending set — GitHub drops a reviewer from it the moment they submit a
+review. Oldest first, because the oldest request is the one blocking someone
+longest. Drafts and archived repos are excluded. Set `ZK_GITHUB_TOKEN` and put
+each person's login in `directory.json` as `github_id`; without a token the
+section is simply absent and the greeting still goes.
+
+If GitHub is unreachable the DM still sends, and says so rather than implying
+an empty queue — "nothing waiting" and "we could not look" mean very different
+things at 9am. An empty queue is phrased as good news.
 
 Setup, in order:
 

@@ -279,15 +279,24 @@ single face match, which is why the cooldown below is not optional.
   the thing you will actually use while building phases 6–8.
 
 ### Phase 6 — GitHub pending work
-- [ ] **M6.1** Decide GitHub App vs PAT (App: per-org install, rotating tokens,
-  no personal account coupling — likely right) and pin least-privilege scopes.
-- [ ] **M6.2** Fetch per person: issues assigned, PRs authored and open, PRs
-  awaiting their review, PRs with unresolved review threads.
+- [~] **M6.1** PAT for now, via `ZK_GITHUB_TOKEN`. A GitHub App is still the
+  right end state, but App auth signs a JWT with **RS256**, which the standard
+  library cannot do — adopting it means taking a crypto dependency on a
+  stdlib-only project. Decide that trade before org-wide rollout; a PAT is one
+  person's credential and sees only what they can see.
+- [~] **M6.2** PRs awaiting their review: done, via
+  `/search/issues?q=is:open is:pr archived:false draft:false
+  review-requested:<login>`, oldest first. Issues assigned, PRs authored, and
+  unresolved review threads are still open.
 - [ ] **M6.3** Normalise to a common `Task {source, title, url, age, urgency}`
   shape shared with Slack.
-- [ ] **M6.4** Rank and truncate: top N, drafts last, staleness surfaced.
-- [ ] **M6.5** Rate-limit budget and caching; degrade to a partial message on
-  failure rather than sending nothing.
+- [x] **M6.4** Oldest first, capped at `ZK_GITHUB_MAX_ITEMS` (5), age shown
+  per PR. Drafts are excluded rather than ranked last — nobody can act on one.
+- [x] **M6.5** Degrades to a partial message: a GitHub failure leaves the
+  greeting intact and says the queue could not be fetched, rather than
+  implying it is empty. Search allows 30 requests a minute and one arrival is
+  one request, so the budget only binds if something else shares the token.
+  Caching is not needed at this volume.
 
 ### Phase 7 — Slack pending work
 - [x] **M7.1** Slack app needs **only `chat:write`**. `chat.postMessage`

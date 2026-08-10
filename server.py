@@ -304,6 +304,10 @@ class Config:
     slack_bot_token: str
     slack_allow: frozenset
     slack_timeout: float
+    github_token: str
+    github_org: str
+    github_max_items: int
+    github_timeout: float
     infino_api_key: str
     infino_timeout: float
     infino_bootstrap: bool
@@ -364,6 +368,12 @@ class Config:
                 u.strip() for u in
                 os.environ.get("ZK_SLACK_ALLOW", "").split(",") if u.strip()),
             slack_timeout=_env_float("ZK_SLACK_TIMEOUT", 10.0),
+            github_token=os.environ.get("ZK_GITHUB_TOKEN", "").strip(),
+            github_org=os.environ.get("ZK_GITHUB_ORG", "").strip(),
+            github_max_items=_env_int("ZK_GITHUB_MAX_ITEMS", 5),
+            # Short on purpose: this runs on the device's request thread, so
+            # every second here delays the terminal's acknowledgement.
+            github_timeout=_env_float("ZK_GITHUB_TIMEOUT", 6.0),
             # INFINO_API_KEY is the name Infino's own SDKs read, so accept it.
             infino_api_key=(os.environ.get("ZK_INFINO_API_KEY", "")
                             or os.environ.get("INFINO_API_KEY", "")),
@@ -407,6 +417,12 @@ class Config:
         elif len(self.auth_token) < 16:
             raise ConfigError("ZK_AUTH_TOKEN is shorter than 16 characters; "
                               "generate one with secrets.token_urlsafe(24)")
+        if self.github_token and not self.github_token.startswith(
+                ("ghp_", "github_pat_", "ghs_", "gho_")):
+            LOG.warning("ZK_GITHUB_TOKEN does not look like a GitHub token "
+                        "(ghp_/github_pat_/ghs_) — check what you pasted")
+        if self.github_max_items < 1:
+            raise ConfigError("ZK_GITHUB_MAX_ITEMS must be at least 1")
         if "slack" in self.sinks:
             if not self.slack_bot_token:
                 raise ConfigError(
@@ -1276,10 +1292,11 @@ class Publisher:
     behind it.
     """
 
-    def __init__(self, cfg, client, slack=None):
+    def __init__(self, cfg, client, slack=None, github=None):
         self.cfg = cfg
         self.client = client
         self.slack = slack
+        self.github = github
         self.dropped = 0
         self.appended = 0
         self.greeted = 0
@@ -1333,9 +1350,20 @@ class Publisher:
         Never raises. Attendance is the job; the greeting is not worth
         refusing a punch over.
         """
-        text, blocks = greeting_message(arrival)
         user_id = arrival.get("employee_user_id")
         slack_id = arrival.get("slack_id")
+        reviews, reviews_failed = None, False
+        if self.github and self.github.configured and arrival.get("github_id"):
+            try:
+                reviews = self.github.review_requests(arrival["github_id"])
+            except GitHubError as e:
+                # M6.5: a partial message beats no message. The greeting is
+                # the point; the review queue is the bonus.
+                reviews_failed = True
+                LOG.error("review queue for %s (%s) unavailable: %s",
+                          arrival.get("person_name") or user_id,
+                          arrival.get("github_id"), e)
+        text, blocks = greeting_message(arrival, reviews, reviews_failed)
 
         if "log_slack" in self.cfg.sinks:
             LOG.info("[log_slack] -> %s (%s): %s",
@@ -1463,27 +1491,176 @@ class SlackClient:
             return self._post("chat.postMessage", payload)
 
 
-def greeting_message(arrival):
+# A GitHub login: alphanumerics and hyphens. Screened before it reaches a
+# search query, since the value comes from a hand-edited directory file.
+_GITHUB_LOGIN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
+
+
+class GitHubError(Exception):
+    pass
+
+
+class GitHubClient:
+    """
+    Finds the pull requests waiting on someone's review.
+
+    `review-requested:<login>` is exactly the pending set — GitHub drops a
+    reviewer from it the moment they submit a review — so there is no need to
+    diff against anything or filter reviewed PRs out afterwards.
+
+    A token, not a GitHub App: App auth signs a JWT with RS256, which the
+    standard library cannot do, and this project has no crypto dependency.
+    That is the whole of ROADMAP M6.1, still open — an App would give per-org
+    installation and rotating credentials instead of one person's PAT.
+    """
+
+    BASE = os.environ.get("ZK_GITHUB_API_URL",
+                          "https://api.github.com").rstrip("/")
+
+    def __init__(self, cfg):
+        self.token = cfg.github_token
+        self.org = cfg.github_org
+        self.max_items = cfg.github_max_items
+        self.timeout = cfg.github_timeout
+
+    @property
+    def configured(self):
+        return bool(self.token)
+
+    def review_requests(self, login):
+        """
+        Open PRs where `login` is a requested reviewer, oldest first — the
+        oldest request is the one blocking someone longest.
+
+        Drafts and archived repositories are excluded: neither is something
+        anyone can act on this morning.
+        """
+        if not _GITHUB_LOGIN_RE.fullmatch(login or ""):
+            raise GitHubError(f"{login!r} is not a valid GitHub login")
+        terms = ["is:open", "is:pr", "archived:false", "draft:false",
+                 f"review-requested:{login}"]
+        if self.org:
+            terms.insert(0, f"org:{self.org}")
+        query = urlencode({"q": " ".join(terms), "sort": "created",
+                           "order": "asc",
+                           "per_page": min(self.max_items, 20)})
+        req = urllib.request.Request(f"{self.BASE}/search/issues?{query}")
+        req.add_header("Accept", "application/vnd.github+json")
+        req.add_header("X-GitHub-Api-Version", "2022-11-28")
+        req.add_header("Authorization", f"Bearer {self.token}")
+        req.add_header("User-Agent", USER_AGENT)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            detail = f"HTTP {e.code}"
+            if e.code in (403, 429):
+                # Search allows 30 requests a minute; one arrival is one
+                # request, so this means something else shares the token.
+                detail += " (rate limited or forbidden)"
+            elif e.code == 401:
+                detail += " (the token is wrong or expired)"
+            elif e.code == 422:
+                detail += " (GitHub rejected the search query)"
+            raise GitHubError(f"search/issues: {detail}")
+        except urllib.error.URLError as e:
+            raise GitHubError(f"cannot reach GitHub: {e.reason}")
+        except TimeoutError:
+            raise GitHubError("GitHub timed out")
+        except ValueError:
+            raise GitHubError("GitHub returned a non-JSON body")
+        return [self._item(i) for i in body.get("items", [])][:self.max_items]
+
+    @staticmethod
+    def _item(item):
+        # `repository_url` is the reliable one: /search/issues items do not
+        # always carry a full repository object.
+        repo = str(item.get("repository_url", "")).rsplit("/repos/", 1)[-1]
+        return {
+            "repo": repo or "?",
+            "number": item.get("number"),
+            "title": (item.get("title") or "").strip(),
+            "url": item.get("html_url"),
+            "author": ((item.get("user") or {}).get("login")) or "?",
+            "age_days": _age_days(item.get("created_at")),
+        }
+
+
+def _age_days(created_at):
+    """Whole days since an ISO-8601 GitHub timestamp, or None."""
+    try:
+        when = datetime.datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        return None
+    return max(0, (_utcnow().replace(tzinfo=None) - when).days)
+
+
+def _age_phrase(days):
+    """A self-contained phrase — "waiting today" is not English."""
+    if days is None:
+        return ""
+    if days == 0:
+        return "opened today"
+    if days == 1:
+        return "waiting 1 day"
+    return f"waiting {days} days"
+
+
+def greeting_message(arrival, reviews=None, reviews_failed=False):
     """
     The good-morning DM.
-
-    Deliberately thin: the GitHub and Slack "pending work" sections are phases
-    6 and 7, and this is the frame they will slot into.
 
     No check-in time, deliberately. The server knows it to the second, but
     quoting it back turns a greeting into a timesheet — the point is to open
     someone's day, not to tell them they were noticed arriving. The footer
     stays, because an unexplained DM from a bot at 9am reads as spam.
+
+    `reviews` is the PRs waiting on them. The empty state is phrased as good
+    news rather than an error, and when GitHub could not be reached the
+    section says so instead of silently implying an empty queue — a missing
+    section and a genuinely empty one mean very different things to someone
+    deciding what to do next.
     """
     name = arrival.get("person_name") or "there"
     text = f"Good morning, {name}!"
     blocks = [
         {"type": "section",
          "text": {"type": "mrkdwn", "text": f"*Good morning, {name}!* :sunny:"}},
+    ]
+
+    if reviews_failed:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn",
+                       "text": ":warning: Could not reach GitHub, so this "
+                               "does not include your review queue."}})
+    elif reviews is not None:
+        if reviews:
+            lines = []
+            for pr in reviews:
+                age = _age_phrase(pr.get("age_days"))
+                waited = f" · {age}" if age else ""
+                lines.append(
+                    f"• <{pr['url']}|{pr['repo']}#{pr['number']}> "
+                    f"{pr['title']}\n   _by {pr['author']}{waited}_")
+            heading = ("*1 pull request is waiting on your review*"
+                       if len(reviews) == 1 else
+                       f"*{len(reviews)} pull requests are waiting on your "
+                       f"review*")
+            blocks.append({"type": "section",
+                           "text": {"type": "mrkdwn",
+                                    "text": heading + "\n" +
+                                            "\n".join(lines)}})
+            text = (f"Good morning, {name}! {len(reviews)} PR(s) waiting on "
+                    f"your review.")
+        else:
+            blocks.append({"type": "section",
+                           "text": {"type": "mrkdwn",
+                                    "text": "Nothing is waiting on your "
+                                            "review. :tada:"}})
+
+    blocks.append(
         {"type": "context",
          "elements": [{"type": "mrkdwn",
-                       "text": "You get this when you arrive at the office."}]},
-    ]
+                       "text": "You get this when you arrive at the office."}]})
     return text, blocks
 
 
@@ -2537,7 +2714,8 @@ def main(argv=None):
         return 0
 
     client = InfinoClient(cfg)
-    publisher = Publisher(cfg, client, SlackClient(cfg))
+    publisher = Publisher(cfg, client, SlackClient(cfg),
+                          GitHubClient(cfg))
     tables = {cfg.infino_table: INFINO_TABLE_SCHEMA,
               cfg.infino_arrivals_table: INFINO_ARRIVALS_SCHEMA,
               cfg.infino_users_table: INFINO_USERS_SCHEMA}
