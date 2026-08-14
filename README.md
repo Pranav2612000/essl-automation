@@ -176,6 +176,10 @@ When someone's first punch of the day lands, they get a Slack DM:
 > • [infino/office-bot#87](#) Add arrivals table
 >   _by ravi · waiting 1 day_
 >
+> **1 pull request merged without your review**
+> • [infino/platform#405](#) Bump the client timeout
+>   _by ravi · merged 11 hours ago_
+>
 > _You get this when you arrive at the office._
 
 No check-in time in the message. The server knows it to the second, but
@@ -188,9 +192,21 @@ longest. Drafts and archived repos are excluded. Set `ZK_GITHUB_TOKEN` and put
 each person's login in `directory.json` as `github_id`; without a token the
 section is simply absent and the greeting still goes.
 
+**Merged without your review** is the other half of the same queue, and the
+half that disappears silently: a PR you were asked to review that shipped
+anyway. Same `review-requested:<login>` qualifier — merging does not clear an
+outstanding review request, so a merged PR still matching it is one you never
+got to — plus `merged:>=<24h ago>`. Nothing there is actionable, so it sits
+below the queue, is left out entirely when empty, and never appears in the
+notification text. Change the window with `ZK_GITHUB_MERGED_HOURS`; `0` turns
+it off and saves the second search per arrival.
+
 If GitHub is unreachable the DM still sends, and says so rather than implying
 an empty queue — "nothing waiting" and "we could not look" mean very different
-things at 9am. An empty queue is phrased as good news.
+things at 9am. An empty queue is phrased as good news. The merged list is the
+exception — if that one search fails it is dropped without a word, because an
+absent section and an empty one read the same and neither costs anyone a
+review.
 
 Setup, in order:
 

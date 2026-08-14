@@ -307,6 +307,7 @@ class Config:
     github_token: str
     github_org: str
     github_max_items: int
+    github_merged_hours: int
     github_timeout: float
     infino_api_key: str
     infino_timeout: float
@@ -371,6 +372,10 @@ class Config:
             github_token=os.environ.get("ZK_GITHUB_TOKEN", "").strip(),
             github_org=os.environ.get("ZK_GITHUB_ORG", "").strip(),
             github_max_items=_env_int("ZK_GITHUB_MAX_ITEMS", 5),
+            # The window for "merged without you". A day covers yesterday
+            # evening, which is when a review request most often gets
+            # overtaken. 0 turns the second search off entirely.
+            github_merged_hours=_env_int("ZK_GITHUB_MERGED_HOURS", 24),
             # Short on purpose: this runs on the device's request thread, so
             # every second here delays the terminal's acknowledgement.
             github_timeout=_env_float("ZK_GITHUB_TIMEOUT", 6.0),
@@ -423,6 +428,8 @@ class Config:
                         "(ghp_/github_pat_/ghs_) — check what you pasted")
         if self.github_max_items < 1:
             raise ConfigError("ZK_GITHUB_MAX_ITEMS must be at least 1")
+        if self.github_merged_hours < 0:
+            raise ConfigError("ZK_GITHUB_MERGED_HOURS cannot be negative")
         if "slack" in self.sinks:
             if not self.slack_bot_token:
                 raise ConfigError(
@@ -1352,7 +1359,8 @@ class Publisher:
         """
         user_id = arrival.get("employee_user_id")
         slack_id = arrival.get("slack_id")
-        reviews, reviews_failed = None, False
+        who = arrival.get("person_name") or user_id
+        reviews, reviews_failed, merged = None, False, None
         if self.github and self.github.configured and arrival.get("github_id"):
             try:
                 reviews = self.github.review_requests(arrival["github_id"])
@@ -1361,14 +1369,22 @@ class Publisher:
                 # the point; the review queue is the bonus.
                 reviews_failed = True
                 LOG.error("review queue for %s (%s) unavailable: %s",
-                          arrival.get("person_name") or user_id,
-                          arrival.get("github_id"), e)
-        text, blocks = greeting_message(arrival, reviews, reviews_failed)
+                          who, arrival.get("github_id"), e)
+            try:
+                merged = self.github.merged_unreviewed(arrival["github_id"])
+            except GitHubError as e:
+                # Not even flagged in the message. This section is a bonus on
+                # a bonus, and an empty one is indistinguishable from a
+                # missing one to the reader, so saying "we could not check
+                # what merged" would only add noise to a good morning.
+                LOG.error("merged-without-review list for %s (%s) "
+                          "unavailable: %s", who, arrival.get("github_id"), e)
+        text, blocks = greeting_message(arrival, reviews, reviews_failed,
+                                        merged)
 
         if "log_slack" in self.cfg.sinks:
             LOG.info("[log_slack] -> %s (%s): %s",
-                     arrival.get("person_name") or user_id,
-                     slack_id or "no slack id", text)
+                     who, slack_id or "no slack id", text)
         if "slack" not in self.cfg.sinks:
             return
         if not slack_id:
@@ -1382,12 +1398,10 @@ class Publisher:
         try:
             self.slack.send_dm(slack_id, text, blocks)
             self.greeted += 1
-            LOG.info("DM sent to %s (%s)",
-                     arrival.get("person_name") or user_id, slack_id)
+            LOG.info("DM sent to %s (%s)", who, slack_id)
         except SlackError as e:
             self.greet_failures += 1
-            LOG.error("DM to %s (%s) failed: %s%s",
-                      arrival.get("person_name") or user_id, slack_id, e,
+            LOG.error("DM to %s (%s) failed: %s%s", who, slack_id, e,
                       "" if e.permanent else " — not retried, they will be "
                       "greeted again tomorrow")
 
@@ -1502,11 +1516,15 @@ class GitHubError(Exception):
 
 class GitHubClient:
     """
-    Finds the pull requests waiting on someone's review.
+    Finds the pull requests waiting on someone's review, and the ones that
+    were merged in the last day without it.
 
     `review-requested:<login>` is exactly the pending set — GitHub drops a
     reviewer from it the moment they submit a review — so there is no need to
-    diff against anything or filter reviewed PRs out afterwards.
+    diff against anything or filter reviewed PRs out afterwards. The same
+    qualifier is what makes the merged query mean "unreviewed": a merge does
+    not clear an outstanding review request, so a merged PR still matching it
+    is one they were asked for and never got to.
 
     A token, not a GitHub App: App auth signs a JWT with RS256, which the
     standard library cannot do, and this project has no crypto dependency.
@@ -1521,6 +1539,7 @@ class GitHubClient:
         self.token = cfg.github_token
         self.org = cfg.github_org
         self.max_items = cfg.github_max_items
+        self.merged_hours = cfg.github_merged_hours
         self.timeout = cfg.github_timeout
 
     @property
@@ -1535,14 +1554,46 @@ class GitHubClient:
         Drafts and archived repositories are excluded: neither is something
         anyone can act on this morning.
         """
+        terms = ["is:open", "is:pr", "archived:false", "draft:false",
+                 f"review-requested:{self._login(login)}"]
+        return self._search(terms, sort="created", order="asc")
+
+    def merged_unreviewed(self, login, hours=None):
+        """
+        PRs merged in the last `hours` that `login` was asked to review and
+        never did, most recently merged first.
+
+        Not a to-do list — nobody can review a merged PR — but "this shipped
+        while you were out and you were on it" is worth knowing before the
+        standup, and it is the half of a review queue that silently vanishes.
+
+        Returns [] when the window is 0, which is how the feature is turned
+        off without a second branch at the call site.
+        """
+        hours = self.merged_hours if hours is None else hours
+        if hours <= 0:
+            return []
+        since = (_utcnow() - datetime.timedelta(hours=hours)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        # `-reviewed-by` is belt and braces next to `review-requested`: the
+        # latter already excludes anyone who reviewed, but this query is the
+        # one whose whole claim is "you never looked at it".
+        terms = ["is:pr", "is:merged", "archived:false",
+                 f"review-requested:{self._login(login)}",
+                 f"-reviewed-by:{self._login(login)}", f"merged:>={since}"]
+        return self._search(terms, sort="updated", order="desc")
+
+    @staticmethod
+    def _login(login):
         if not _GITHUB_LOGIN_RE.fullmatch(login or ""):
             raise GitHubError(f"{login!r} is not a valid GitHub login")
-        terms = ["is:open", "is:pr", "archived:false", "draft:false",
-                 f"review-requested:{login}"]
+        return login
+
+    def _search(self, terms, sort, order):
         if self.org:
             terms.insert(0, f"org:{self.org}")
-        query = urlencode({"q": " ".join(terms), "sort": "created",
-                           "order": "asc",
+        query = urlencode({"q": " ".join(terms), "sort": sort,
+                           "order": order,
                            "per_page": min(self.max_items, 20)})
         req = urllib.request.Request(f"{self.BASE}/search/issues?{query}")
         req.add_header("Accept", "application/vnd.github+json")
@@ -1576,6 +1627,10 @@ class GitHubClient:
         # `repository_url` is the reliable one: /search/issues items do not
         # always carry a full repository object.
         repo = str(item.get("repository_url", "")).rsplit("/repos/", 1)[-1]
+        # search/issues carries the merge timestamp on the nested
+        # `pull_request` object; `closed_at` is the fallback, and for an
+        # is:merged result the two are the same instant anyway.
+        pr = item.get("pull_request") or {}
         return {
             "repo": repo or "?",
             "number": item.get("number"),
@@ -1583,16 +1638,31 @@ class GitHubClient:
             "url": item.get("html_url"),
             "author": ((item.get("user") or {}).get("login")) or "?",
             "age_days": _age_days(item.get("created_at")),
+            "merged_hours": _age_hours(pr.get("merged_at")
+                                       or item.get("closed_at")),
         }
+
+
+def _elapsed(timestamp):
+    """Time since an ISO-8601 GitHub timestamp, or None if unparseable."""
+    try:
+        when = datetime.datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        return None
+    return max(datetime.timedelta(0),
+               _utcnow().replace(tzinfo=None) - when)
 
 
 def _age_days(created_at):
     """Whole days since an ISO-8601 GitHub timestamp, or None."""
-    try:
-        when = datetime.datetime.strptime(created_at, "%Y-%m-%dT%H:%M:%SZ")
-    except (TypeError, ValueError):
-        return None
-    return max(0, (_utcnow().replace(tzinfo=None) - when).days)
+    elapsed = _elapsed(created_at)
+    return None if elapsed is None else elapsed.days
+
+
+def _age_hours(timestamp):
+    """Whole hours since an ISO-8601 GitHub timestamp, or None."""
+    elapsed = _elapsed(timestamp)
+    return None if elapsed is None else int(elapsed.total_seconds() // 3600)
 
 
 def _age_phrase(days):
@@ -1606,7 +1676,19 @@ def _age_phrase(days):
     return f"waiting {days} days"
 
 
-def greeting_message(arrival, reviews=None, reviews_failed=False):
+def _merged_phrase(hours):
+    """"merged 3 hours ago" — same self-contained shape as _age_phrase."""
+    if hours is None:
+        return "merged"
+    if hours < 1:
+        return "merged just now"
+    if hours == 1:
+        return "merged 1 hour ago"
+    return f"merged {hours} hours ago"
+
+
+def greeting_message(arrival, reviews=None, reviews_failed=False,
+                     merged=None):
     """
     The good-morning DM.
 
@@ -1620,6 +1702,12 @@ def greeting_message(arrival, reviews=None, reviews_failed=False):
     section says so instead of silently implying an empty queue — a missing
     section and a genuinely empty one mean very different things to someone
     deciding what to do next.
+
+    `merged` is the PRs that shipped without their review. It gets its own
+    section below the queue, and *only* when there are some: an empty one is
+    the normal case and needs no words, whereas an empty review queue is news
+    worth congratulating. Nothing here is actionable, so it never enters the
+    fallback text — the notification should be about what they can still do.
     """
     name = arrival.get("person_name") or "there"
     text = f"Good morning, {name}!"
@@ -1656,6 +1744,20 @@ def greeting_message(arrival, reviews=None, reviews_failed=False):
                            "text": {"type": "mrkdwn",
                                     "text": "Nothing is waiting on your "
                                             "review. :tada:"}})
+
+    if merged:
+        lines = []
+        for pr in merged:
+            lines.append(
+                f"• <{pr['url']}|{pr['repo']}#{pr['number']}> {pr['title']}\n"
+                f"   _by {pr['author']} · "
+                f"{_merged_phrase(pr.get('merged_hours'))}_")
+        heading = ("*1 pull request merged without your review*"
+                   if len(merged) == 1 else
+                   f"*{len(merged)} pull requests merged without your review*")
+        blocks.append({"type": "section",
+                       "text": {"type": "mrkdwn",
+                                "text": heading + "\n" + "\n".join(lines)}})
 
     blocks.append(
         {"type": "context",

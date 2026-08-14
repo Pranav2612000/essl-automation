@@ -286,17 +286,26 @@ single face match, which is why the cooldown below is not optional.
   person's credential and sees only what they can see.
 - [~] **M6.2** PRs awaiting their review: done, via
   `/search/issues?q=is:open is:pr archived:false draft:false
-  review-requested:<login>`, oldest first. Issues assigned, PRs authored, and
-  unresolved review threads are still open.
+  review-requested:<login>`, oldest first. PRs *merged* in the last
+  `ZK_GITHUB_MERGED_HOURS` (24) while their review request was still
+  outstanding are listed too, in their own section — a merge does not clear a
+  review request, so the same qualifier plus `is:merged merged:>=<since>` is
+  exactly "shipped without you". Issues assigned, PRs authored, and unresolved
+  review threads are still open.
 - [ ] **M6.3** Normalise to a common `Task {source, title, url, age, urgency}`
   shape shared with Slack.
 - [x] **M6.4** Oldest first, capped at `ZK_GITHUB_MAX_ITEMS` (5), age shown
   per PR. Drafts are excluded rather than ranked last — nobody can act on one.
+  The merged-without-you list uses the same cap but the opposite order —
+  newest merge first, since the only reason to read it is to catch up.
 - [x] **M6.5** Degrades to a partial message: a GitHub failure leaves the
   greeting intact and says the queue could not be fetched, rather than
   implying it is empty. Search allows 30 requests a minute and one arrival is
   one request, so the budget only binds if something else shares the token.
-  Caching is not needed at this volume.
+  Caching is not needed at this volume. The merged-without-you list adds a
+  second search per arrival (still 2 of 30 per minute) and degrades further
+  still: its failure drops the section silently rather than warning, since
+  nothing in it is actionable.
 
 ### Phase 7 — Slack pending work
 - [x] **M7.1** Slack app needs **only `chat:write`**. `chat.postMessage`
