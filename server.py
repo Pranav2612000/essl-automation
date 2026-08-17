@@ -124,6 +124,12 @@ LOG = logging.getLogger("essl")
 # for every configured sink of the kind it qualifies for.
 ATTENDANCE_SINKS = frozenset({"log", "infino"})
 ARRIVAL_SINKS = frozenset({"log_arrivals", "infino_arrivals"})
+
+# Nobody returns from three months away to a useful list of five pull
+# requests, so the merged-without-you window stops here however long they have
+# been gone. Not a knob: it is a ceiling on nostalgia, not a preference.
+MERGED_LOOKBACK_CAP_DAYS = 30
+
 # 'slack' sends a real DM to a real person. 'log_slack' renders the message
 # and prints it, which is the only way to iterate on wording safely.
 GREETING_SINKS = frozenset({"log_slack", "slack"})
@@ -307,7 +313,7 @@ class Config:
     github_token: str
     github_org: str
     github_max_items: int
-    github_merged_hours: int
+    github_merged_fallback_hours: int
     github_timeout: float
     infino_api_key: str
     infino_timeout: float
@@ -372,10 +378,12 @@ class Config:
             github_token=os.environ.get("ZK_GITHUB_TOKEN", "").strip(),
             github_org=os.environ.get("ZK_GITHUB_ORG", "").strip(),
             github_max_items=_env_int("ZK_GITHUB_MAX_ITEMS", 5),
-            # The window for "merged without you". A day covers yesterday
-            # evening, which is when a review request most often gets
-            # overtaken. 0 turns the second search off entirely.
-            github_merged_hours=_env_int("ZK_GITHUB_MERGED_HOURS", 24),
+            # "Merged without you" normally runs from their last arrival.
+            # This is the window used when there is no last arrival to run
+            # from — a first day, or an unreadable ledger. 0 turns the
+            # second search off altogether.
+            github_merged_fallback_hours=_env_int(
+                "ZK_GITHUB_MERGED_FALLBACK_HOURS", 24),
             # Short on purpose: this runs on the device's request thread, so
             # every second here delays the terminal's acknowledgement.
             github_timeout=_env_float("ZK_GITHUB_TIMEOUT", 6.0),
@@ -428,8 +436,9 @@ class Config:
                         "(ghp_/github_pat_/ghs_) — check what you pasted")
         if self.github_max_items < 1:
             raise ConfigError("ZK_GITHUB_MAX_ITEMS must be at least 1")
-        if self.github_merged_hours < 0:
-            raise ConfigError("ZK_GITHUB_MERGED_HOURS cannot be negative")
+        if self.github_merged_fallback_hours < 0:
+            raise ConfigError(
+                "ZK_GITHUB_MERGED_FALLBACK_HOURS cannot be negative")
         if "slack" in self.sinks:
             if not self.slack_bot_token:
                 raise ConfigError(
@@ -1344,6 +1353,71 @@ class Publisher:
         self._emit("infino_arrivals", "log_arrivals",
                    self.cfg.infino_arrivals_table, rows, "arrival")
 
+    def last_arrival(self, user_id, before_local_date):
+        """
+        `(arrived_at, local_date)` of this person's most recent arrival before
+        `before_local_date`, or `(None, None)` if the ledger has none.
+
+        Cut off by date rather than by excluding the current row: the arrival
+        that triggered this greeting was appended moments ago and an append
+        takes about half a second to become visible, so "is it there yet" is
+        not a question worth asking. Yesterday's row is long since settled.
+
+        One row per person per day makes this cheap, and MAX over an empty set
+        is NULL, which is exactly the answer for someone's first day.
+        """
+        if not self.client.configured:
+            return None, None
+        if "infino_arrivals" not in self.cfg.sinks:
+            # Nothing has been writing the ledger, so anything in it is stale
+            # in a way that would mislead rather than inform.
+            return None, None
+        rows = self.client.rows(
+            f"SELECT MAX(arrived_at) AS arrived_at, "
+            f"       MAX(local_date) AS local_date "
+            f"  FROM {self.cfg.infino_arrivals_table} "
+            f" WHERE employee_user_id = {_sql_text(user_id)} "
+            f"   AND local_date < {_sql_text(before_local_date)}")
+        row = rows[0] if rows else {}
+        return row.get("arrived_at"), row.get("local_date")
+
+    def merged_window(self, arrival):
+        """
+        `(since, phrase)` for the merged-without-you search: an ISO-8601 UTC
+        instant to search from, and how the DM should name it.
+
+        The instant is their previous arrival — the honest reading of "what
+        shipped while I was away", and the reason a Monday greeting reaches
+        back over the weekend instead of losing Friday evening to a fixed
+        24 hours. Three things can make that unavailable: a first day, a
+        log-only deployment, and an unreachable ledger. All three fall back to
+        the configured window, which is a worse answer than the real one and a
+        much better answer than no section.
+        """
+        user_id = arrival.get("employee_user_id")
+        today = arrival.get("local_date")
+        since, last_date = None, None
+        if user_id and today:
+            try:
+                since, last_date = self.last_arrival(user_id, today)
+            except InfinoError as e:
+                LOG.warning("no last-arrival date for %s (%s) — the "
+                            "merged-without-review window falls back to %dh",
+                            arrival.get("person_name") or user_id, e,
+                            self.cfg.github_merged_fallback_hours)
+        if not since:
+            hours = self.cfg.github_merged_fallback_hours
+            return (_iso(_utcnow() - datetime.timedelta(hours=hours)),
+                    _window_phrase(hours))
+        # Both sides are the same fixed-width UTC format, so this compares as
+        # text. Someone back from a long absence gets a month, not a year:
+        # five PRs from last spring is archaeology, not a catch-up.
+        floor = _iso(_utcnow() -
+                     datetime.timedelta(days=MERGED_LOOKBACK_CAP_DAYS))
+        if since < floor:
+            return floor, f"in the last {MERGED_LOOKBACK_CAP_DAYS} days"
+        return since, _since_phrase(last_date, today)
+
     def greet(self, arrival):
         """
         DM the person who just arrived.
@@ -1360,7 +1434,8 @@ class Publisher:
         user_id = arrival.get("employee_user_id")
         slack_id = arrival.get("slack_id")
         who = arrival.get("person_name") or user_id
-        reviews, reviews_failed, merged = None, False, None
+        reviews, reviews_failed = None, False
+        merged, merged_since = None, ""
         if self.github and self.github.configured and arrival.get("github_id"):
             try:
                 reviews = self.github.review_requests(arrival["github_id"])
@@ -1370,17 +1445,21 @@ class Publisher:
                 reviews_failed = True
                 LOG.error("review queue for %s (%s) unavailable: %s",
                           who, arrival.get("github_id"), e)
-            try:
-                merged = self.github.merged_unreviewed(arrival["github_id"])
-            except GitHubError as e:
-                # Not even flagged in the message. This section is a bonus on
-                # a bonus, and an empty one is indistinguishable from a
-                # missing one to the reader, so saying "we could not check
-                # what merged" would only add noise to a good morning.
-                LOG.error("merged-without-review list for %s (%s) "
-                          "unavailable: %s", who, arrival.get("github_id"), e)
+            if self.github.merged_enabled:
+                since, merged_since = self.merged_window(arrival)
+                try:
+                    merged = self.github.merged_unreviewed(
+                        arrival["github_id"], since)
+                except GitHubError as e:
+                    # Not even flagged in the message. This section is a bonus
+                    # on a bonus, and an empty one is indistinguishable from a
+                    # missing one to the reader, so saying "we could not check
+                    # what merged" would only add noise to a good morning.
+                    LOG.error("merged-without-review list for %s (%s) "
+                              "unavailable: %s",
+                              who, arrival.get("github_id"), e)
         text, blocks = greeting_message(arrival, reviews, reviews_failed,
-                                        merged)
+                                        merged, merged_since)
 
         if "log_slack" in self.cfg.sinks:
             LOG.info("[log_slack] -> %s (%s): %s",
@@ -1517,7 +1596,7 @@ class GitHubError(Exception):
 class GitHubClient:
     """
     Finds the pull requests waiting on someone's review, and the ones that
-    were merged in the last day without it.
+    merged without it while they were away.
 
     `review-requested:<login>` is exactly the pending set — GitHub drops a
     reviewer from it the moment they submit a review — so there is no need to
@@ -1539,12 +1618,17 @@ class GitHubClient:
         self.token = cfg.github_token
         self.org = cfg.github_org
         self.max_items = cfg.github_max_items
-        self.merged_hours = cfg.github_merged_hours
+        self.merged_fallback_hours = cfg.github_merged_fallback_hours
         self.timeout = cfg.github_timeout
 
     @property
     def configured(self):
         return bool(self.token)
+
+    @property
+    def merged_enabled(self):
+        """False turns off the second search, and the lookup that feeds it."""
+        return self.merged_fallback_hours > 0
 
     def review_requests(self, login):
         """
@@ -1558,29 +1642,31 @@ class GitHubClient:
                  f"review-requested:{self._login(login)}"]
         return self._search(terms, sort="created", order="asc")
 
-    def merged_unreviewed(self, login, hours=None):
+    def merged_unreviewed(self, login, since):
         """
-        PRs merged in the last `hours` that `login` was asked to review and
-        never did, most recently merged first.
+        PRs merged since `since` (an ISO-8601 UTC string, normally the moment
+        of their last arrival) that `login` was asked to review and never
+        touched, most recently merged first.
 
         Not a to-do list — nobody can review a merged PR — but "this shipped
         while you were out and you were on it" is worth knowing before the
         standup, and it is the half of a review queue that silently vanishes.
 
-        Returns [] when the window is 0, which is how the feature is turned
-        off without a second branch at the call site.
+        Three exclusions, because "never touched" has three shapes:
+        `review-requested` drops anyone who submitted a review, `-reviewed-by`
+        says the same thing explicitly since it is this query's whole claim,
+        and `-commenter` drops the PRs they only talked on — commenting does
+        not clear a review request, so without it someone who said "LGTM, not
+        blocking" in the thread would still be told they missed it. Comments
+        made after the merge count too: the qualifiers match on the comment
+        existing, not on when it landed.
         """
-        hours = self.merged_hours if hours is None else hours
-        if hours <= 0:
-            return []
-        since = (_utcnow() - datetime.timedelta(hours=hours)).strftime(
-            "%Y-%m-%dT%H:%M:%SZ")
-        # `-reviewed-by` is belt and braces next to `review-requested`: the
-        # latter already excludes anyone who reviewed, but this query is the
-        # one whose whole claim is "you never looked at it".
+        login = self._login(login)
+        if not since:
+            raise GitHubError("merged_unreviewed needs a start of window")
         terms = ["is:pr", "is:merged", "archived:false",
-                 f"review-requested:{self._login(login)}",
-                 f"-reviewed-by:{self._login(login)}", f"merged:>={since}"]
+                 f"review-requested:{login}", f"-reviewed-by:{login}",
+                 f"-commenter:{login}", f"merged:>={since}"]
         return self._search(terms, sort="updated", order="desc")
 
     @staticmethod
@@ -1684,11 +1770,52 @@ def _merged_phrase(hours):
         return "merged just now"
     if hours == 1:
         return "merged 1 hour ago"
-    return f"merged {hours} hours ago"
+    if hours < 48:
+        return f"merged {hours} hours ago"
+    days = hours // 24
+    return f"merged {days} days ago"
+
+
+def _window_phrase(hours):
+    """
+    The fallback window, said plainly.
+
+    Deliberately not "since yesterday": this phrasing is used exactly when the
+    server does not know when they were last here, and borrowing the language
+    of a real last visit would claim knowledge it does not have.
+    """
+    if hours == 1:
+        return "in the last hour"
+    if hours < 48:
+        return f"in the last {hours} hours"
+    return f"in the last {hours // 24} days"
+
+
+def _since_phrase(last_date, today):
+    """
+    Names the day someone was last in — "since Friday", "since yesterday".
+
+    A weekday name is only unambiguous inside a week; past that it becomes a
+    date. Both are calendar days in the device's timezone rather than UTC,
+    because the reader's "Friday" is the one the office had.
+    """
+    try:
+        last = datetime.date.fromisoformat(last_date)
+        now = datetime.date.fromisoformat(today)
+    except (TypeError, ValueError):
+        return "since you were last in"
+    gap = (now - last).days
+    if gap <= 0:
+        return "since earlier today"
+    if gap == 1:
+        return "since yesterday"
+    if gap < 7:
+        return f"since {last.strftime('%A')}"
+    return f"since {last.day} {last.strftime('%B')}"
 
 
 def greeting_message(arrival, reviews=None, reviews_failed=False,
-                     merged=None):
+                     merged=None, merged_since=""):
     """
     The good-morning DM.
 
@@ -1703,11 +1830,15 @@ def greeting_message(arrival, reviews=None, reviews_failed=False,
     section and a genuinely empty one mean very different things to someone
     deciding what to do next.
 
-    `merged` is the PRs that shipped without their review. It gets its own
-    section below the queue, and *only* when there are some: an empty one is
-    the normal case and needs no words, whereas an empty review queue is news
-    worth congratulating. Nothing here is actionable, so it never enters the
-    fallback text — the notification should be about what they can still do.
+    `merged` is the PRs that shipped without their review, and `merged_since`
+    names the window they were found in — "since Friday". Naming it is the
+    whole point of the section: "merged without your review" invites "since
+    when?", and the answer is what tells someone whether this is the weekend's
+    backlog or this morning's. It gets its own section below the queue, and
+    *only* when there are some: an empty one is the normal case and needs no
+    words, whereas an empty review queue is news worth congratulating. Nothing
+    here is actionable, so it never enters the fallback text — the
+    notification should be about what they can still do.
     """
     name = arrival.get("person_name") or "there"
     text = f"Good morning, {name}!"
@@ -1752,9 +1883,11 @@ def greeting_message(arrival, reviews=None, reviews_failed=False,
                 f"• <{pr['url']}|{pr['repo']}#{pr['number']}> {pr['title']}\n"
                 f"   _by {pr['author']} · "
                 f"{_merged_phrase(pr.get('merged_hours'))}_")
-        heading = ("*1 pull request merged without your review*"
+        window = f" {merged_since}" if merged_since else ""
+        heading = (f"*1 pull request merged without your review{window}*"
                    if len(merged) == 1 else
-                   f"*{len(merged)} pull requests merged without your review*")
+                   f"*{len(merged)} pull requests merged without your "
+                   f"review{window}*")
         blocks.append({"type": "section",
                        "text": {"type": "mrkdwn",
                                 "text": heading + "\n" + "\n".join(lines)}})

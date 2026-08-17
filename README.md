@@ -176,9 +176,9 @@ When someone's first punch of the day lands, they get a Slack DM:
 > • [infino/office-bot#87](#) Add arrivals table
 >   _by ravi · waiting 1 day_
 >
-> **1 pull request merged without your review**
+> **1 pull request merged without your review since Friday**
 > • [infino/platform#405](#) Bump the client timeout
->   _by ravi · merged 11 hours ago_
+>   _by ravi · merged 2 days ago_
 >
 > _You get this when you arrive at the office._
 
@@ -190,16 +190,33 @@ the pending set — GitHub drops a reviewer from it the moment they submit a
 review. Oldest first, because the oldest request is the one blocking someone
 longest. Drafts and archived repos are excluded. Set `ZK_GITHUB_TOKEN` and put
 each person's login in `directory.json` as `github_id`; without a token the
-section is simply absent and the greeting still goes.
+section is simply absent and the greeting still goes. Commenting on an open PR
+does not clear it from this list — only submitting a review does, which is
+GitHub's rule and the right one: a question in the thread is not a review.
 
 **Merged without your review** is the other half of the same queue, and the
 half that disappears silently: a PR you were asked to review that shipped
 anyway. Same `review-requested:<login>` qualifier — merging does not clear an
 outstanding review request, so a merged PR still matching it is one you never
-got to — plus `merged:>=<24h ago>`. Nothing there is actionable, so it sits
-below the queue, is left out entirely when empty, and never appears in the
-notification text. Change the window with `ZK_GITHUB_MERGED_HOURS`; `0` turns
-it off and saves the second search per arrival.
+got to — with `-reviewed-by:` and `-commenter:` on top, so anything you
+reviewed *or* just commented on is out, whether you said it before the merge
+or after.
+
+**The window is your last arrival**, read from the arrivals ledger: one
+`MAX(arrived_at) … WHERE local_date < today` per greeting. A fixed 24 hours
+would lose Friday evening to every Monday, and a week is wrong for someone who
+was in yesterday — "since you were last here" is the only window that is right
+for both, and the DM says which day it means (*"since Friday"*, *"since
+yesterday"*). Someone back from a long absence gets at most
+`MERGED_LOOKBACK_CAP_DAYS` (30) of it; five PRs from last spring is
+archaeology, not a catch-up. Without a last arrival to read — a first day, a
+log-only deployment, an unreachable ledger — it falls back to
+`ZK_GITHUB_MERGED_FALLBACK_HOURS` (24) and says *"in the last 24 hours"*
+rather than claiming to know when you were last in. `0` turns the section off
+and saves both the ledger read and the second search.
+
+Nothing in the section is actionable, so it sits below the queue, is left out
+entirely when empty, and never appears in the notification text.
 
 If GitHub is unreachable the DM still sends, and says so rather than implying
 an empty queue — "nothing waiting" and "we could not look" mean very different
