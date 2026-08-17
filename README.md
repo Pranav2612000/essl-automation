@@ -218,12 +218,26 @@ and saves both the ledger read and the second search.
 Nothing in the section is actionable, so it sits below the queue, is left out
 entirely when empty, and never appears in the notification text.
 
-If GitHub is unreachable the DM still sends, and says so rather than implying
-an empty queue — "nothing waiting" and "we could not look" mean very different
-things at 9am. An empty queue is phrased as good news. The merged list is the
-exception — if that one search fails it is dropped without a word, because an
-absent section and an empty one read the same and neither costs anyone a
-review.
+**Failures are visible in the DM, not just the log.** Every line in the
+message is a claim about someone's morning, and a claim made on incomplete
+data has to say so or it will be believed:
+
+| What broke | What the DM says |
+| --- | --- |
+| GitHub unreachable | :warning: Could not reach GitHub, so this does not include your review queue. |
+| Infino unreachable | :warning: Could not reach Infino to check when you were last in, so this only covers the last 24 hours. |
+| The merged search alone | *nothing* — the section is dropped silently |
+
+"Nothing waiting" and "we could not look" mean very different things at 9am,
+so an empty queue is phrased as good news and an unreachable GitHub is
+phrased as a gap. The Infino caveat is the same idea one level down: the
+merged list is real, but it was gathered over a shorter window than it should
+have been, which matters *most* when it comes back empty. It appears whenever
+the ledger read failed and the search still ran — including when the list is
+empty — and it is a small context line rather than a banner, because it
+annotates the list rather than replacing it. The merged search failing on its
+own stays silent: an absent section and an empty one read the same, and
+neither costs anyone a review.
 
 Setup, in order:
 

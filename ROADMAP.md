@@ -309,9 +309,13 @@ single face match, which is why the cooldown below is not optional.
   one request, so the budget only binds if something else shares the token.
   Caching is not needed at this volume. The merged-without-you list adds a
   second search per arrival (still 2 of 30 per minute) plus one ledger query,
-  and degrades further still: a failed ledger read narrows the window to the
-  fallback, and a failed search drops the section silently rather than
-  warning, since nothing in it is actionable.
+  and degrades on its own terms: a failed ledger read narrows the window to
+  the fallback **and says so in the DM** — the caveat matters most when the
+  list comes back empty, since a short window is what would make it look
+  reassuring — while a failed search drops the section silently, because
+  nothing in it is actionable and an absent section reads like an empty one.
+  Three states, three different sentences; the rule is that the message never
+  claims more than it checked.
 
 ### Phase 7 — Slack pending work
 - [x] **M7.1** Slack app needs **only `chat:write`**. `chat.postMessage`

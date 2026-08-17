@@ -1383,8 +1383,9 @@ class Publisher:
 
     def merged_window(self, arrival):
         """
-        `(since, phrase)` for the merged-without-you search: an ISO-8601 UTC
-        instant to search from, and how the DM should name it.
+        `(since, phrase, failed)` for the merged-without-you search: an
+        ISO-8601 UTC instant to search from, how the DM should name it, and
+        whether the ledger read that should have decided it failed.
 
         The instant is their previous arrival — the honest reading of "what
         shipped while I was away", and the reason a Monday greeting reaches
@@ -1393,14 +1394,22 @@ class Publisher:
         log-only deployment, and an unreachable ledger. All three fall back to
         the configured window, which is a worse answer than the real one and a
         much better answer than no section.
+
+        Only the third is worth telling the reader about, hence the flag. The
+        other two are permanent facts about their situation, not today's
+        weather — someone on their first day cannot act on "there was no
+        previous visit to measure from", whereas a narrowed window on a normal
+        Monday is exactly the sort of thing that makes an empty list mean less
+        than it appears to.
         """
         user_id = arrival.get("employee_user_id")
         today = arrival.get("local_date")
-        since, last_date = None, None
+        since, last_date, failed = None, None, False
         if user_id and today:
             try:
                 since, last_date = self.last_arrival(user_id, today)
             except InfinoError as e:
+                failed = True
                 LOG.warning("no last-arrival date for %s (%s) — the "
                             "merged-without-review window falls back to %dh",
                             arrival.get("person_name") or user_id, e,
@@ -1408,15 +1417,15 @@ class Publisher:
         if not since:
             hours = self.cfg.github_merged_fallback_hours
             return (_iso(_utcnow() - datetime.timedelta(hours=hours)),
-                    _window_phrase(hours))
+                    _window_phrase(hours), failed)
         # Both sides are the same fixed-width UTC format, so this compares as
         # text. Someone back from a long absence gets a month, not a year:
         # five PRs from last spring is archaeology, not a catch-up.
         floor = _iso(_utcnow() -
                      datetime.timedelta(days=MERGED_LOOKBACK_CAP_DAYS))
         if since < floor:
-            return floor, f"in the last {MERGED_LOOKBACK_CAP_DAYS} days"
-        return since, _since_phrase(last_date, today)
+            return floor, f"in the last {MERGED_LOOKBACK_CAP_DAYS} days", False
+        return since, _since_phrase(last_date, today), False
 
     def greet(self, arrival):
         """
@@ -1434,32 +1443,32 @@ class Publisher:
         user_id = arrival.get("employee_user_id")
         slack_id = arrival.get("slack_id")
         who = arrival.get("person_name") or user_id
-        reviews, reviews_failed = None, False
-        merged, merged_since = None, ""
+        digest = ReviewDigest()
         if self.github and self.github.configured and arrival.get("github_id"):
             try:
-                reviews = self.github.review_requests(arrival["github_id"])
+                digest.queue = self.github.review_requests(
+                    arrival["github_id"])
             except GitHubError as e:
                 # M6.5: a partial message beats no message. The greeting is
                 # the point; the review queue is the bonus.
-                reviews_failed = True
+                digest.queue_failed = True
                 LOG.error("review queue for %s (%s) unavailable: %s",
                           who, arrival.get("github_id"), e)
             if self.github.merged_enabled:
-                since, merged_since = self.merged_window(arrival)
+                since, digest.window, digest.window_failed = \
+                    self.merged_window(arrival)
                 try:
-                    merged = self.github.merged_unreviewed(
+                    digest.merged = self.github.merged_unreviewed(
                         arrival["github_id"], since)
                 except GitHubError as e:
-                    # Not even flagged in the message. This section is a bonus
-                    # on a bonus, and an empty one is indistinguishable from a
-                    # missing one to the reader, so saying "we could not check
-                    # what merged" would only add noise to a good morning.
+                    # Not flagged in the message, unlike the queue above and
+                    # unlike a bad window. This section is a bonus on a bonus,
+                    # and an absent one reads the same as an empty one, so
+                    # "we could not check what merged" would only add noise.
                     LOG.error("merged-without-review list for %s (%s) "
                               "unavailable: %s",
                               who, arrival.get("github_id"), e)
-        text, blocks = greeting_message(arrival, reviews, reviews_failed,
-                                        merged, merged_since)
+        text, blocks = greeting_message(arrival, digest)
 
         if "log_slack" in self.cfg.sinks:
             LOG.info("[log_slack] -> %s (%s): %s",
@@ -1591,6 +1600,28 @@ _GITHUB_LOGIN_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})")
 
 class GitHubError(Exception):
     pass
+
+
+@dataclass
+class ReviewDigest:
+    """
+    Everything the greeting knows about someone's pull requests, and how
+    confident it is about each part.
+
+    A plain bundle rather than five positional arguments: the failure flags
+    only mean anything next to the data they qualify, and an empty list next
+    to `queue_failed=True` is a different message from an empty list next to
+    `queue_failed=False`. Keeping them together makes that impossible to get
+    wrong at the call site.
+    """
+
+    queue: list = None          # PRs waiting on their review; None if unknown
+    queue_failed: bool = False  # GitHub was unreachable, so `queue` is a lie
+    merged: list = None         # merged without them; None if never fetched
+    window: str = ""            # how to name the window: "since Friday"
+    # Infino was unreachable, so `window` is the configured fallback rather
+    # than the last visit it should have been measured from.
+    window_failed: bool = False
 
 
 class GitHubClient:
@@ -1814,8 +1845,7 @@ def _since_phrase(last_date, today):
     return f"since {last.day} {last.strftime('%B')}"
 
 
-def greeting_message(arrival, reviews=None, reviews_failed=False,
-                     merged=None, merged_since=""):
+def greeting_message(arrival, digest=None):
     """
     The good-morning DM.
 
@@ -1824,22 +1854,31 @@ def greeting_message(arrival, reviews=None, reviews_failed=False,
     someone's day, not to tell them they were noticed arriving. The footer
     stays, because an unexplained DM from a bot at 9am reads as spam.
 
-    `reviews` is the PRs waiting on them. The empty state is phrased as good
-    news rather than an error, and when GitHub could not be reached the
+    `digest.queue` is the PRs waiting on them. The empty state is phrased as
+    good news rather than an error, and when GitHub could not be reached the
     section says so instead of silently implying an empty queue — a missing
     section and a genuinely empty one mean very different things to someone
     deciding what to do next.
 
-    `merged` is the PRs that shipped without their review, and `merged_since`
-    names the window they were found in — "since Friday". Naming it is the
-    whole point of the section: "merged without your review" invites "since
-    when?", and the answer is what tells someone whether this is the weekend's
-    backlog or this morning's. It gets its own section below the queue, and
-    *only* when there are some: an empty one is the normal case and needs no
-    words, whereas an empty review queue is news worth congratulating. Nothing
-    here is actionable, so it never enters the fallback text — the
-    notification should be about what they can still do.
+    `digest.merged` is the PRs that shipped without their review, and
+    `digest.window` names the window they were found in — "since Friday".
+    Naming it is the whole point of the section: "merged without your review"
+    invites "since when?", and the answer is what tells someone whether this
+    is the weekend's backlog or this morning's. It gets its own section below
+    the queue, and *only* when there are some: an empty one is the normal case
+    and needs no words, whereas an empty review queue is news worth
+    congratulating. Nothing here is actionable, so it never enters the
+    fallback text — the notification should be about what they can still do.
+
+    Both failure flags become visible caveats, for the same reason: every
+    line in this message is a claim about someone's morning, and a claim made
+    on incomplete data has to say so or it will be believed. They read
+    differently because they fail differently — an unreachable GitHub means
+    there is no queue to show, while an unreachable ledger means the merged
+    list is real but was gathered over a shorter window than it should have
+    been, which matters most precisely when it comes back empty.
     """
+    digest = digest or ReviewDigest()
     name = arrival.get("person_name") or "there"
     text = f"Good morning, {name}!"
     blocks = [
@@ -1847,7 +1886,8 @@ def greeting_message(arrival, reviews=None, reviews_failed=False,
          "text": {"type": "mrkdwn", "text": f"*Good morning, {name}!* :sunny:"}},
     ]
 
-    if reviews_failed:
+    reviews = digest.queue
+    if digest.queue_failed:
         blocks.append({"type": "section", "text": {"type": "mrkdwn",
                        "text": ":warning: Could not reach GitHub, so this "
                                "does not include your review queue."}})
@@ -1876,21 +1916,42 @@ def greeting_message(arrival, reviews=None, reviews_failed=False,
                                     "text": "Nothing is waiting on your "
                                             "review. :tada:"}})
 
-    if merged:
+    if digest.merged:
         lines = []
-        for pr in merged:
+        for pr in digest.merged:
             lines.append(
                 f"• <{pr['url']}|{pr['repo']}#{pr['number']}> {pr['title']}\n"
                 f"   _by {pr['author']} · "
                 f"{_merged_phrase(pr.get('merged_hours'))}_")
-        window = f" {merged_since}" if merged_since else ""
+        window = f" {digest.window}" if digest.window else ""
         heading = (f"*1 pull request merged without your review{window}*"
-                   if len(merged) == 1 else
-                   f"*{len(merged)} pull requests merged without your "
+                   if len(digest.merged) == 1 else
+                   f"*{len(digest.merged)} pull requests merged without your "
                    f"review{window}*")
         blocks.append({"type": "section",
                        "text": {"type": "mrkdwn",
                                 "text": heading + "\n" + "\n".join(lines)}})
+
+    # Only when the search actually ran: if GitHub failed too there is no
+    # merged list for this to be a caveat about, and two warnings about one
+    # missing section is one warning too many. A context block rather than a
+    # section because it annotates the list above rather than replacing it —
+    # and it still earns its place when that list is empty, since "nothing
+    # merged without you" is exactly the claim a short window undermines.
+    if digest.merged is not None and digest.window_failed:
+        # The heading carries its own preposition ("… review in the last 24
+        # hours"), so trim it here rather than write "covers in the last 24
+        # hours". A window is only ever "failed" when it fell back, so the
+        # "since Friday" form cannot reach this branch.
+        span = (digest.window[len("in "):]
+                if digest.window.startswith("in ")
+                else "a shorter window than usual")
+        blocks.append(
+            {"type": "context",
+             "elements": [{"type": "mrkdwn",
+                           "text": ":warning: Could not reach Infino to check "
+                                   "when you were last in, so this only "
+                                   f"covers {span}."}]})
 
     blocks.append(
         {"type": "context",
